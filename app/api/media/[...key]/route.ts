@@ -1,15 +1,21 @@
 import { files } from "@/lib/db";
 import { denied } from "@/lib/guard";
+import { parseRange, resolveRange } from "@/lib/range";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Authenticated-by-obscurity media proxy. R2 is not public; the dashboard plays
- * clips through this route. Supports HTTP Range so <video> can seek.
+ * Media proxy. R2 is not public; the dashboard plays clips through this route.
+ *
+ * Range support is what makes `<video>` work at all: it needs 206 responses
+ * whose `content-length` matches the bytes actually sent and whose
+ * `content-range` is relative to the whole object. Reporting the object's full
+ * size on a partial body makes the player wait for bytes that never arrive.
  */
 export async function GET(req: Request, ctx: { params: Promise<{ key: string[] }> }) {
   const gate = await denied();
   if (gate) return gate;
+
   const { key } = await ctx.params;
   const path = key.join("/");
   if (!/^[a-zA-Z0-9._/-]+$/.test(path) || path.includes("..")) {
@@ -18,41 +24,73 @@ export async function GET(req: Request, ctx: { params: Promise<{ key: string[] }
 
   try {
     const store = await files();
-    const range = req.headers.get("range");
-    let object: R2ObjectBody | null;
+    const head = await store.head(path);
+    if (!head) return new Response("not found", { status: 404 });
 
-    if (range) {
-      const match = /bytes=(\d+)-(\d*)/.exec(range);
-      if (match) {
-        const offset = Number(match[1]);
-        const length = match[2] ? Number(match[2]) - offset + 1 : undefined;
-        object = await store.get(path, { range: { offset, length } });
-        if (!object) return new Response("not found", { status: 404 });
-        return new Response(object.body, {
-          status: 206,
-          headers: {
-            "content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
-            "content-range": `bytes ${offset}-${offset + object.size - 1}`,
-            "accept-ranges": "bytes",
-            "content-length": String(object.size),
-            "cache-control": "public, max-age=86400",
-          },
-        });
-      }
+    const headers = new Headers({
+      "content-type": head.httpMetadata?.contentType ?? "application/octet-stream",
+      "accept-ranges": "bytes",
+      // The route is gated per user, so a shared cache must never hold it.
+      "cache-control": "private, max-age=3600",
+      etag: head.httpEtag ?? "",
+    });
+
+    const requested = parseRange(req.headers.get("range"));
+    const range = requested ? resolveRange(requested, head.size) : null;
+
+    if (range === "unsatisfiable") {
+      return new Response(null, {
+        status: 416,
+        headers: { "content-range": `bytes */${head.size}`, "accept-ranges": "bytes" },
+      });
     }
 
-    object = await store.get(path);
-    if (!object) return new Response("not found", { status: 404 });
-    return new Response(object.body, {
-      headers: {
-        "content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
-        "content-length": String(object.size),
-        "accept-ranges": "bytes",
-        "cache-control": "public, max-age=86400",
-        etag: object.httpEtag ?? "",
-      },
+    if (!range) {
+      headers.set("content-length", String(head.size));
+      const object = await store.get(path);
+      if (!object) return new Response("not found", { status: 404 });
+      return new Response(object.body, { headers });
+    }
+
+    const object = await store.get(path, {
+      range: { offset: range.start, length: range.length },
     });
+    if (!object) return new Response("not found", { status: 404 });
+
+    headers.set(
+      "content-range",
+      `bytes ${range.start}-${range.start + range.length - 1}/${head.size}`,
+    );
+    headers.set("content-length", String(range.length));
+    return new Response(object.body, { status: 206, headers });
   } catch (err) {
     return new Response(String(err), { status: 500 });
+  }
+}
+
+export async function HEAD(req: Request, ctx: { params: Promise<{ key: string[] }> }) {
+  const gate = await denied();
+  if (gate) return new Response(null, { status: 401 });
+
+  const { key } = await ctx.params;
+  const path = key.join("/");
+  if (!/^[a-zA-Z0-9._/-]+$/.test(path) || path.includes("..")) {
+    return new Response(null, { status: 400 });
+  }
+
+  try {
+    const store = await files();
+    const head = await store.head(path);
+    if (!head) return new Response(null, { status: 404 });
+    return new Response(null, {
+      headers: {
+        "content-type": head.httpMetadata?.contentType ?? "application/octet-stream",
+        "accept-ranges": "bytes",
+        "content-length": String(head.size),
+        etag: head.httpEtag ?? "",
+      },
+    });
+  } catch {
+    return new Response(null, { status: 500 });
   }
 }
