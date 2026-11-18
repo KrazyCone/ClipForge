@@ -500,9 +500,11 @@ export class Collector {
     if (!this.vod.configured) return;
     // Not immediately: the first bursts of a run are the live path's job, and
     // an archive VOD does not exist until a stream has ended anyway.
-    const firstDrain = setTimeout(() => void this.drainQueuedWork(), 120_000);
+    const firstDrain = setTimeout(() => void this.drainQueuedWork(), 60_000);
     firstDrain.unref();
-    this.drainTimer = setInterval(() => void this.drainQueuedWork(), 180_000);
+    // A re-cut should land in a couple of minutes, not after the next long
+    // drain interval; the pass is cheap when there is no work.
+    this.drainTimer = setInterval(() => void this.drainQueuedWork(), 60_000);
   }
 
   /**
@@ -513,6 +515,9 @@ export class Collector {
     if (this.draining || this.stopping || !this.vod.configured) return;
     this.draining = true;
     try {
+      // Re-cuts first: a queued rebuild of a live moment can be served by the
+      // ring buffer, whereas drainQueue would defer it until the stream ends.
+      await this.drainLiveRebuilds();
       const result = await drainQueue({
         api: this.api,
         vod: this.vod,
@@ -533,14 +538,44 @@ export class Collector {
 
   private bufferSeconds(): number {
     const settings = this.settings;
-    // Four minutes of headroom beyond the clip window: a burst can put several
-    // moments behind two render slots, and a queue that outlives the buffer is
-    // a moment that can never be cut while the stream is live. At 1080p this is
-    // roughly a quarter of a gigabyte per channel on the runner's disk.
+    // Eight minutes beyond the clip window: a burst can put several moments
+    // behind two render slots, and a re-cut of a clip made a few minutes ago
+    // needs its source footage still on disk. At 1080p this is roughly a
+    // third of a gigabyte per channel on the runner's disk.
     return Math.max(
-      240,
-      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 240,
+      300,
+      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 480,
     );
+  }
+
+  /**
+   * Re-cuts queued spikes from the live ring buffer. Without this a rebuild of
+   * a moment from a channel that is still live has to wait for the archive VOD,
+   * which only appears when the stream ends - possibly days later.
+   */
+  private async drainLiveRebuilds(): Promise<void> {
+    let queue: Awaited<ReturnType<ClipforgeApi["queue"]>>;
+    try {
+      queue = await this.api.queue(3);
+    } catch {
+      return;
+    }
+    const now = Date.now() / 1000;
+    const window = this.bufferSeconds() - 20;
+    for (const spike of queue.spikes) {
+      if (this.stopping) return;
+      // Tail of the buffer is still being written; skip moments the recorder
+      // cannot cover yet.
+      if (now - spike.ts_unix > window) continue;
+      // Only re-cuts: a fresh spike is already being handled by the detector.
+      if (!spike.analyze_json) continue;
+      const login = spike.channel_login.toLowerCase();
+      const state = this.states.get(login);
+      if (!state || !this.recorders.has(login)) continue;
+
+      log(`rebuild ${spike.id}: re-cutting ${login} from the live buffer`);
+      void this.captureLive(state, spike.ts_unix, spike.id, { waitForTail: false });
+    }
   }
 
   /**
@@ -629,7 +664,12 @@ export class Collector {
    * Turns a just-detected spike into a finished clip from the ring buffer, in
    * the same process, with no VOD dependency.
    */
-  private async captureLive(state: ChannelState, ts: number, spikeId: string): Promise<void> {
+  private async captureLive(
+    state: ChannelState,
+    ts: number,
+    spikeId: string,
+    options: { waitForTail?: boolean } = {},
+  ): Promise<void> {
     const recorder = this.recorders.get(state.login);
     const settings = this.settings;
     if (!recorder || !settings) return;
@@ -656,8 +696,9 @@ export class Collector {
       const lead = Math.max(settings.preEventSec, 15);
       const tail = Math.max(settings.postEventSec, 15);
 
-      // Wait for the post-roll to be written into the buffer.
-      await sleep((tail + 2) * 1000);
+      // Wait for the post-roll to be written into the buffer. A rebuild is
+      // already minutes old, so there is nothing to wait for.
+      if (options.waitForTail !== false) await sleep((tail + 2) * 1000);
 
       // The segment writer can be a couple of seconds behind, so give the
       // buffer a few chances before declaring the moment uncuttable.

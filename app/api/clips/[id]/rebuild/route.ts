@@ -63,7 +63,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     await ensureAnalyzeColumn(d);
     await d
       .prepare("UPDATE spikes SET analyze_json = ?, status = 'queued' WHERE id = ?")
-      .bind(Object.keys(patch).length ? JSON.stringify(patch) : null, clip.spike_id)
+      // "{}" still marks the spike as a re-cut, which is how the collector
+      // knows it may use the live buffer instead of the archive VOD.
+      .bind(JSON.stringify(patch), clip.spike_id)
       .run();
 
     return json({ ok: true, queued: true, patch: Object.keys(patch).length ? patch : null });

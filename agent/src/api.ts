@@ -27,6 +27,8 @@ export interface QueueSpike {
   unique_chatters: number;
   features_json: string | null;
   samples_json: string | null;
+  /** non-null when this is a re-cut rather than a freshly detected moment */
+  analyze_json?: string | null;
   stream_title: string;
   game_name: string;
   display_name: string;
