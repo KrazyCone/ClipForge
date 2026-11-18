@@ -121,6 +121,51 @@ export function ffprobeHasAudio(file: string): Promise<boolean> {
     proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
     proc.on("error", () => resolve(false));
     proc.on("close", () => resolve(out.trim().length > 0));
+  }).then(async (found) => {
+    if (found) return true;
+    // Some ffprobe builds cannot read MPEG-TS at all and return nothing, even
+    // though the file has audio. ffmpeg's own stream listing is a second
+    // opinion; without it a live clip would silently render without sound.
+    const info = await ffmpeg(
+      ["-hide_banner", "-i", file, "-t", "0.1", "-f", "null", "-"],
+      30_000,
+    ).catch((err: Error) => err.message);
+    return /Stream #\d+:\d+.*: Audio:/.test(info);
+  });
+}
+
+/** Audio and video durations of a finished file, for sync verification. */
+export function ffprobeStreamDurations(
+  file: string,
+): Promise<{ video: number; audio: number } | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "ffprobe",
+      [
+        "-v", "error",
+        "-show_entries", "stream=codec_type,duration",
+        "-of", "json",
+        file,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let out = "";
+    proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
+    proc.on("error", () => resolve(null));
+    proc.on("close", () => {
+      try {
+        const streams = (JSON.parse(out) as { streams?: { codec_type?: string; duration?: string }[] })
+          .streams ?? [];
+        const video = streams.find((s) => s.codec_type === "video");
+        const audio = streams.find((s) => s.codec_type === "audio");
+        resolve({
+          video: Number(video?.duration) || 0,
+          audio: Number(audio?.duration) || 0,
+        });
+      } catch {
+        resolve(null);
+      }
+    });
   });
 }
 
@@ -199,6 +244,8 @@ export interface RenderOptions {
   webcam?: WebcamBox | null;
   /** stack an enlarged webcam band above the gameplay */
   focusWebcam?: boolean;
+  /** hard limit for a slow render; the webcam pass gets a tighter budget */
+  timeoutMs?: number;
 }
 
 /**
@@ -208,12 +255,15 @@ export interface RenderOptions {
 export async function renderClip(opts: RenderOptions): Promise<void> {
   const { width, height } = dimsFor(opts.aspect);
 
+  // Drop to 30 fps before scaling, blurring and compositing. A 1080p60 source
+  // used to do all of that twice as often as the output needed, which is what
+  // pushed busy live renders into the five-minute timeout.
   let videoFilter: string;
   if (opts.aspect === "16:9") {
-    videoFilter = `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
+    videoFilter = `fps=30,scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
   } else if (opts.cropMode === "blur") {
     videoFilter =
-      `split=2[bg][fg];` +
+      `fps=30,split=2[bg][fg];` +
       `[bg]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=26[bgb];` +
       `[fg]scale=${width}:-2:force_original_aspect_ratio=decrease[fgs];` +
       `[bgb][fgs]overlay=(W-w)/2:(H-h)/2`;
@@ -222,7 +272,7 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     // the right-hand HUD, center is the default.
     const anchor = opts.cropX === "left" ? 0 : opts.cropX === "right" ? 1 : 0.5;
     videoFilter =
-      `scale=${width}:${height}:force_original_aspect_ratio=increase,` +
+      `fps=30,scale=${width}:${height}:force_original_aspect_ratio=increase,` +
       `crop=${width}:${height}:(iw-${width})*${anchor}:(ih-${height})/2`;
   }
 
@@ -252,6 +302,7 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     "-filter_complex", filterComplex,
     "-map", "[v]",
     "-map", "0:a?",
+    "-af", "aresample=48000:async=1:first_pts=0",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "21",
@@ -265,7 +316,7 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     "-movflags", "+faststart",
     "-y",
     opts.outPath,
-  ], 240_000);
+  ], opts.timeoutMs ?? 240_000);
 }
 
 /**
@@ -287,7 +338,7 @@ function webcamChains(
 ): string[] {
   const f = (n: number) => n.toFixed(4);
   return [
-    `[${source}]split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
+    `[${source}]fps=30,split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
     `[wcFaceSrc]crop=iw*${f(box.w)}:ih*${f(box.h)}:iw*${f(box.x)}:ih*${f(box.y)},` +
       `scale=1080:860:force_original_aspect_ratio=increase,crop=1080:860,setsar=1[wcFace]`,
     `[wcGameSrc]scale=1080:1060:force_original_aspect_ratio=decrease[wcGameFit]`,
@@ -365,7 +416,7 @@ async function renderJoined(
   );
   if (hasAudio) args.push("-c:a", "aac", "-b:a", "128k", "-ar", "48000");
   args.push("-movflags", "+faststart", "-y", opts.outPath);
-  await ffmpeg(args, 300_000);
+  await ffmpeg(args, opts.timeoutMs ?? 300_000);
 }
 
 export async function thumbnail(videoPath: string, outPath: string): Promise<void> {

@@ -4,9 +4,17 @@
  */
 import { rm, writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
-import { audioLoudness, renderClip, thumbnail, extractAudio, sampleFrames } from "./ffmpeg.js";
+import {
+  audioLoudness,
+  ffprobeStreamDurations,
+  renderClip,
+  thumbnail,
+  extractAudio,
+  sampleFrames,
+  type RenderOptions,
+} from "./ffmpeg.js";
 import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
-import { parseWebcamBox } from "./webcam.js";
+import { describeWebcam, parseWebcamBox } from "./webcam.js";
 import type { AgentSettings, AnalyzeBeat, AnalyzeResult, QueueClip, TimedCaption } from "./api.js";
 import type { ClipforgeApi } from "./api.js";
 import { log } from "./config.js";
@@ -31,6 +39,31 @@ export interface ProduceOptions {
   beats?: AnalyzeBeat[];
   /** subtitles already remapped onto the assembled timeline */
   captions?: TimedCaption[];
+}
+
+/**
+ * Renders, and if the webcam composite is what failed (a busy runner hitting
+ * the timeout, a source the crop chokes on) renders again with the normal
+ * layout instead of losing the clip. The extra log line is also how the
+ * operator can tell whether the webcam path actually ran.
+ */
+export async function renderWithFallback(opts: RenderOptions, label: string): Promise<void> {
+  const webcam = opts.focusWebcam && opts.webcam ? opts.webcam : null;
+  const started = Date.now();
+  try {
+    await renderClip(webcam ? { ...opts, timeoutMs: opts.timeoutMs ?? 180_000 } : opts);
+  } catch (err) {
+    if (!webcam) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    log(`${label}: webcam layout failed (${message.slice(0, 160)}) - retrying normally`);
+    await renderClip({ ...opts, webcam: null, focusWebcam: false, timeoutMs: 180_000 });
+  }
+  log(`${label}: render took ${((Date.now() - started) / 1000).toFixed(0)}s`);
+
+  const av = await ffprobeStreamDurations(opts.outPath).catch(() => null);
+  if (av && av.audio > 0 && Math.abs(av.video - av.audio) > 0.35) {
+    log(`${label}: warning - video ${av.video.toFixed(2)}s vs audio ${av.audio.toFixed(2)}s`);
+  }
 }
 
 export async function produceClipFromFile(opts: ProduceOptions): Promise<number> {
@@ -76,18 +109,26 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
   await writeFile(assPath, ass, "utf8");
 
   const outPath = path.join(workDir, "live.mp4");
-  await renderClip({
-    input: sourceFile,
-    startSec: startInSource,
-    durationSec: duration,
-    segments: joined ? cuts : undefined,
-    outPath,
-    assPath,
-    aspect: settings.aspectRatio,
-    cropMode: "blur",
-    webcam: parseWebcamBox(clip.webcam_json),
-    focusWebcam: settings.webcamFocus === true,
-  });
+  log(
+    `live clip ${clip.id}: webcam ${describeWebcam(clip.webcam_json)}` +
+      (settings.webcamFocus === true ? "" : " (enlargement off)") +
+      `, ${joined ? `${cuts.length} cuts` : "single cut"}`,
+  );
+  await renderWithFallback(
+    {
+      input: sourceFile,
+      startSec: startInSource,
+      durationSec: duration,
+      segments: joined ? cuts : undefined,
+      outPath,
+      assPath,
+      aspect: settings.aspectRatio,
+      cropMode: "blur",
+      webcam: parseWebcamBox(clip.webcam_json),
+      focusWebcam: settings.webcamFocus === true,
+    },
+    `live clip ${clip.id}`,
+  );
 
   const thumbPath = path.join(workDir, "live.jpg");
   await thumbnail(outPath, thumbPath);

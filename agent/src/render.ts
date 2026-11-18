@@ -20,9 +20,10 @@ import type {
   TimedCaption,
 } from "./api.js";
 import type { TwitchVod } from "./twitch.js";
-import { audioLoudness, extractAudio, renderClip, sampleFrames, thumbnail } from "./ffmpeg.js";
+import { audioLoudness, extractAudio, sampleFrames, thumbnail } from "./ffmpeg.js";
 import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
-import { parseWebcamBox } from "./webcam.js";
+import { describeWebcam, parseWebcamBox } from "./webcam.js";
+import { renderWithFallback } from "./produce.js";
 
 /**
  * Twitch only publishes a broadcast as an archive VOD once the stream ends, so
@@ -181,18 +182,25 @@ async function renderClipJob(
   await writeFile(assPath, ass, "utf8");
 
   const outPath = path.join(workDir, "clip.mp4");
-  await renderClip({
-    input: playlist,
-    startSec: start,
-    durationSec: duration,
-    segments: joined ? cuts : undefined,
-    outPath,
-    assPath,
-    aspect: settings.aspectRatio,
-    cropMode: "blur",
-    webcam: parseWebcamBox(clip.webcam_json),
-    focusWebcam: settings.webcamFocus === true,
-  });
+  log(
+    `clip ${clip.id}: webcam ${describeWebcam(clip.webcam_json)}` +
+      (settings.webcamFocus === true ? "" : " (enlargement off)"),
+  );
+  await renderWithFallback(
+    {
+      input: playlist,
+      startSec: start,
+      durationSec: duration,
+      segments: joined ? cuts : undefined,
+      outPath,
+      assPath,
+      aspect: settings.aspectRatio,
+      cropMode: "blur",
+      webcam: parseWebcamBox(clip.webcam_json),
+      focusWebcam: settings.webcamFocus === true,
+    },
+    `clip ${clip.id}`,
+  );
 
   const thumbPath = path.join(workDir, "thumb.jpg");
   await thumbnail(outPath, thumbPath);

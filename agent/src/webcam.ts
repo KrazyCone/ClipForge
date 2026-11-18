@@ -6,6 +6,18 @@ export interface WebcamBox {
   h: number;
 }
 
+/** Human label for logs and the clip view: "bottom-right large" or "none". */
+export function describeWebcam(json: string | null | undefined): string {
+  const box = parseWebcamBox(json);
+  if (!box) return "none";
+  try {
+    const value = JSON.parse(json ?? "{}") as { region?: string; size?: string };
+    return `${value.region ?? "detected"}${value.size ? ` ${value.size}` : ""}`;
+  } catch {
+    return "detected";
+  }
+}
+
 export function parseWebcamBox(json: string | null | undefined): WebcamBox | null {
   if (!json) return null;
   try {
