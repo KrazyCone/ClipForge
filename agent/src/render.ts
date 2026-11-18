@@ -126,8 +126,9 @@ async function renderClipJob(
   // start_offset/end_offset are absolute unix seconds set by the analyser.
   const startOffset = clip.start_offset ?? clip.source_ts;
   const endOffset = clip.end_offset ?? startOffset + settings.clipDurationSec;
-  const leadIn = Math.max(0, clip.source_ts - startOffset);
-  const start = Math.max(0, found.offset - leadIn);
+  // start_offset may sit before or after the spike, so translate it into the
+  // VOD rather than always rewinding from the spike.
+  const start = Math.max(0, found.offset + (startOffset - clip.source_ts));
   const duration = Math.max(6, Math.min(60, endOffset - startOffset));
 
   // Transcript was captured during analysis and stored on the clip.

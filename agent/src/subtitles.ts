@@ -69,22 +69,41 @@ export function buildAss(
   const clean = transcript.replace(/\s+/g, " ").trim();
   if (!clean) return header;
 
-  // Split into short phrases at punctuation, then fit them to the runtime.
-  const phrases: string[] = [];
-  for (const chunk of clean.split(/(?<=[.!?])\s+|,\s+/)) {
-    if (!chunk.trim()) continue;
-    const lines = wrapLines(chunk, 26);
-    for (let i = 0; i < lines.length; i += 2) {
-      phrases.push(lines.slice(i, i + 2).join("\\N"));
+  // Build caption cards of at most two lines. Punctuation closes a card; a long
+  // unpunctuated transcript is still split so it never becomes one wall of text.
+  const cards: string[][] = [];
+  let current: string[] = [];
+  for (const word of clean.replace(/[{}]/g, "").split(" ")) {
+    const lastLine = current[current.length - 1];
+    if (lastLine !== undefined && `${lastLine} ${word}`.length <= 26) {
+      current[current.length - 1] = `${lastLine} ${word}`;
+    } else if (current.length < 2) {
+      current.push(word);
+    } else {
+      cards.push(current);
+      current = [word];
+    }
+    if (/[.!?]$/.test(word)) {
+      cards.push(current);
+      current = [];
     }
   }
+  if (current.length) cards.push(current);
+
+  const phrases = cards.map((lines) => lines.join("\\N"));
   if (phrases.length === 0) return header;
 
-  const per = durationSec / phrases.length;
+  // Time each card by how much text it holds: a long sentence stays up longer
+  // than a two-word reaction, which is far closer to speech than equal slots.
+  const weights = phrases.map((p) => p.replace(/\\N/g, " ").length || 1);
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
   const events: string[] = [];
+  let cursor = 0;
   phrases.forEach((phrase, index) => {
-    const start = index * per;
-    const end = Math.min(durationSec, start + per * 0.96);
+    const span = (durationSec * weights[index]) / totalWeight;
+    const start = cursor;
+    const end = Math.min(durationSec, cursor + span * 0.96);
+    cursor += span;
     events.push(
       `Dialogue: 0,${assTime(start)},${assTime(end)},ClipForge,,0,0,0,,{\\c${s.colour}\\bord${s.outline}}${phrase}`,
     );

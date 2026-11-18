@@ -630,15 +630,21 @@ export class Collector {
     let workDir: string | null = null;
     let snapDir: string | null = null;
     try {
+      // The analyser decides where the clip starts and ends, so capture enough
+      // footage around the peak for it to choose from rather than just the
+      // configured pre/post roll.
+      const lead = Math.max(settings.preEventSec, 15);
+      const tail = Math.max(settings.postEventSec, 15);
+
       // Wait for the post-roll to be written into the buffer.
-      await sleep((settings.postEventSec + 2) * 1000);
+      await sleep((tail + 2) * 1000);
 
       // The segment writer can be a couple of seconds behind, so give the
       // buffer a few chances before declaring the moment uncuttable.
-      let snap = await recorder.snapshot(ts, settings.preEventSec, settings.postEventSec);
+      let snap = await recorder.snapshot(ts, lead, tail);
       for (let attempt = 0; !snap && attempt < 3; attempt++) {
         await sleep(3_000);
-        snap = await recorder.snapshot(ts, settings.preEventSec, settings.postEventSec);
+        snap = await recorder.snapshot(ts, lead, tail);
       }
       if (!snap) {
         log(`no buffer coverage for ${state.login} - moment left for a later pass`);
@@ -650,13 +656,9 @@ export class Collector {
       // keep the offsets inside the footage that was actually written.
       const startInSnap = Math.max(
         0,
-        Math.min(ts - settings.preEventSec - snap.startSec, Math.max(0, snap.durationSec - 3)),
+        Math.min(ts - lead - snap.startSec, Math.max(0, snap.durationSec - 3)),
       );
-      const window = Math.min(
-        45,
-        settings.preEventSec + settings.postEventSec + 12,
-        Math.max(2, snap.durationSec - startInSnap),
-      );
+      const window = Math.min(45, Math.max(2, snap.durationSec - startInSnap));
 
       workDir = await mkdtemp(path.join(tmpdir(), "clipforge-live-"));
       const analysis = await analyseLocal(
@@ -684,6 +686,9 @@ export class Collector {
       if (!analysis.clipId || !analysis.clip) {
         log(`live analysis produced no clip for ${state.login}`);
         return;
+      }
+      if (!analysis.transcript) {
+        log(`no speech transcript for ${state.login} - clip gets the caption card, not spoken subtitles`);
       }
 
       await produceClipFromFile({
