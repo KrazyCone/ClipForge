@@ -75,12 +75,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // --- audio transcription --------------------------------------------
     let transcript = body.transcript ?? "";
     let sttProvider = "none";
+    let sttError: string | null = null;
     if (!transcript && body.audioBase64 && body.audioBase64.length < MAX_AUDIO_CHARS) {
       const binary = Uint8Array.from(atob(body.audioBase64), (c) => c.charCodeAt(0));
       const stt = await transcribe(e, binary.buffer);
       if (stt?.text) {
         transcript = stt.text;
         sttProvider = stt.provider;
+      } else if (stt?.error) {
+        // Recorded instead of swallowed: no transcript means no spoken
+        // subtitles, and the operator should be able to see why.
+        sttError = stt.error;
       }
     }
 
@@ -102,7 +107,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     await d
       .prepare("UPDATE spikes SET ai_json = ?, ai_provider = ?, status = ? WHERE id = ?")
       .bind(
-        JSON.stringify({ ...analysis, visualNotes, transcript, sttProvider, visionError }),
+        JSON.stringify({ ...analysis, visualNotes, transcript, sttProvider, sttError, visionError }),
         analysis.provider,
         analysis.qualityScore >= settings.minQualityScore ? "rendering" : "skipped",
         id,
@@ -133,11 +138,24 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     const clipId = crypto.randomUUID();
     const now = new Date().toISOString();
-    const startOffset = Math.max(0, spike.ts_unix - settings.preEventSec);
-    const durationSec = Math.min(
-      settings.clipDurationSec,
-      Math.max(8, analysis.endsAtSec - analysis.beginsAtSec || settings.clipDurationSec),
+    // The analyser reports the moment's span as offsets from the spike peak.
+    // Earlier replies carried absolute timestamps, so rebase those rather than
+    // producing a clip decades long.
+    const rebase = (value: unknown, fallback: number): number => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return fallback;
+      return n > 1_000_000_000 ? n - spike.ts_unix : n;
+    };
+    const beginsAt = Math.max(-20, Math.min(4, rebase(analysis.beginsAtSec, -settings.preEventSec)));
+    const endsAt = Math.max(
+      beginsAt + 6,
+      Math.min(beginsAt + 45, rebase(analysis.endsAtSec, beginsAt + settings.clipDurationSec)),
     );
+    // The duration setting is the ceiling, not the target: a short reaction
+    // stays short instead of being padded to it.
+    const maxSpan = Math.max(8, Math.min(60, settings.clipDurationSec));
+    const durationSec = Math.max(6, Math.min(maxSpan, endsAt - beginsAt));
+    const startOffset = Math.max(0, spike.ts_unix + beginsAt);
 
     await d
       .prepare(

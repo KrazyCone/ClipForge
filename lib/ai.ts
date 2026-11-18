@@ -78,7 +78,7 @@ async function runModel(e: Env, model: string, body: unknown): Promise<unknown> 
 export async function transcribe(
   e: Env,
   audio: ArrayBuffer,
-): Promise<{ text: string; provider: string } | null> {
+): Promise<{ text: string; provider: string; error?: string } | null> {
   if (!aiConfigured(e)) return null;
   const model = e.STT_MODEL || "@cf/openai/whisper-large-v3-turbo";
   try {
@@ -86,9 +86,11 @@ export async function transcribe(
     const json = (await runModel(e, model, { audio: binary })) as {
       result?: { text?: string };
     };
-    return { text: json.result?.text ?? "", provider: model };
-  } catch {
-    return null;
+    return { text: (json.result?.text ?? "").trim(), provider: model };
+  } catch (err) {
+    // A silent failure here means a clip with no spoken subtitles and no
+    // explanation; the caller records this on the spike.
+    return { text: "", provider: model, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -133,24 +135,55 @@ export async function describeFrame(
   }
 }
 
+/**
+ * Copy describes what happened in the clip itself. Chat reaction is a signal for
+ * finding the moment, not the subject of it, so none of these mention chat.
+ */
 function heuristicCaptions(input: MomentInput, category: string): string[] {
-  const n = input.channelName;
-  const vibe = category === "funny" ? "BRO" : category === "dramatic" ? "NAH" : "WAIT";
+  const n = input.channelName.toUpperCase();
+  const g = (input.gameName ?? "the game").toUpperCase();
+  if (category === "funny") {
+    return [
+      `BRO REALLY DID THAT 💀`,
+      `NOT THE ${g} PLAY 💀`,
+      `I WOULD HAVE UNINSTALLED`,
+      `${n} HAS LOST IT`,
+      `THAT WAS NOT IN THE SCRIPT`,
+    ];
+  }
+  if (category === "dramatic") {
+    return [
+      `NAH THAT CLUTCH WAS INSANE`,
+      `DOWN TO THE LAST SECOND`,
+      `${n} CLUTCHED IT`,
+      `IT WAS OVER AND HE SAVED IT`,
+      `LAST CHANCE AND HE TOOK IT`,
+    ];
+  }
+  if (category === "surprising") {
+    return [
+      `NOBODY SAW THAT COMING`,
+      `WAIT WHAT JUST HAPPENED`,
+      `${n} FLIPPED THE WHOLE ${g} GAME`,
+      `THAT WAS NOT SUPPOSED TO WORK`,
+      `INSTANT ${g} HIGHLIGHT`,
+    ];
+  }
   return [
-    `${vibe} ${n.toUpperCase()} DID NOT JUST DO THAT 💀`,
-    `THE CHAT WAS NOT READY FOR THIS`,
-    `I WOULD HAVE UNINSTALLED`,
-    `${n} BROKE THE GAME AND THE CHAT`,
-    `THIS IS WHY YOU WATCH LIVE`,
+    `${n} POPPED OFF`,
+    `THAT ${g} PLAY WAS PERFECT`,
+    `BEST MOMENT OF THE STREAM`,
+    `HE MADE THAT LOOK EASY`,
+    `REWATCH THIS ONE`,
   ];
 }
 
 function heuristicTitles(input: MomentInput, category: string): string[] {
   const g = input.gameName ?? "stream";
-  if (category === "funny") return [`${input.channelName} breaks chat`, `Certified ${g} comedy`, `Chat lost it`];
+  if (category === "funny") return [`${input.channelName} loses it`, `Certified ${g} comedy`, `That went badly`];
   if (category === "dramatic") return [`${input.channelName} clutches it`, `Down to the wire`, `No way that happened`];
   if (category === "surprising") return [`${input.channelName} flips the game`, `Nobody saw this coming`, `Instant ${g} highlight`];
-  return [`${input.channelName} pops off`, `${g} highlight`, `Chat goes wild`];
+  return [`${input.channelName} pops off`, `${g} highlight`, `That was clean`];
 }
 
 export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
@@ -158,7 +191,6 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
   const captions = heuristicCaptions(input, category);
   const titles = heuristicTitles(input, category);
   const seed = Math.abs(Math.round(input.ts / 7)) % captions.length;
-  const duration = clamp(Math.round(input.features.burstEnd - input.features.burstStart), 8, 30);
   return {
     summary: reasoning,
     whyChatReacted:
@@ -168,8 +200,10 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
     category: category as MomentAnalysis["category"],
     qualityScore: score,
     funniness: category === "funny" ? clamp(score + 6, 0, 100) : clamp(score - 18, 0, 100),
-    beginsAtSec: input.features.burstStart,
-    endsAtSec: input.features.burstStart + duration,
+    // Offsets from the spike peak, not timestamps: three seconds of lead-in and
+    // a few seconds after the reaction settles.
+    beginsAtSec: -3,
+    endsAtSec: 7,
     title: titles[seed % titles.length],
     caption: captions[seed],
     hashtags: ["#twitch", "#clips", `#${(input.gameName ?? "gaming").toLowerCase().replace(/[^a-z0-9]/g, "")}`, "#fyp"],
@@ -178,9 +212,14 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
   };
 }
 
-const PROMPT = `You analyse Twitch chat and stream signals to decide whether a moment is worth clipping for TikTok/Shorts/Reels.
+const PROMPT = `You analyse Twitch stream signals to decide whether a moment is worth clipping for TikTok/Shorts/Reels.
 Reply with JSON only, no prose, matching this shape:
-{"summary":"one sentence on what happened","whyChatReacted":"one sentence","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"beginsAtSec":number,"endsAtSec":number,"title":"short title","caption":"ALL CAPS meme caption under 60 chars","hashtags":["#tag"]}`;
+{"summary":"one sentence on what happened in the clip","whyChatReacted":"one sentence on the chat reaction","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"beginsAtSec":number,"endsAtSec":number,"title":"short title","caption":"ALL CAPS caption under 60 chars","hashtags":["#tag"]}
+Rules:
+- beginsAtSec and endsAtSec are OFFSETS IN SECONDS FROM THE SPIKE PEAK, not timestamps. 0 is the peak, negative is footage before it.
+- Choose the span that contains the actual action and nothing else: usually -4 to +8 seconds, up to 25 seconds for a longer play. Never pad the clip.
+- title and caption describe what HAPPENED IN THE VIDEO: the play, the reaction, the outcome. Never mention chat, viewers, donations or "chat going wild" - the chat is only how the moment was found, it is not the story.
+- Prefer concrete wording (the play, the game, the outcome) over generic hype.`;
 
 function safeParse(text: string): Partial<MomentAnalysis> | null {
   const start = text.indexOf("{");
