@@ -49,6 +49,7 @@ export interface QueueClip {
   stream_title: string | null;
   transcript: string | null;
   status: string;
+  created_at?: string;
 }
 
 export interface AnalyzedClip {

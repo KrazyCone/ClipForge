@@ -22,6 +22,7 @@ import type { ChatMessage } from "../../lib/spike.js";
 import { LiveRecorder, sleep } from "./live.js";
 import { TwitchVod } from "./twitch.js";
 import { analyseLocal, cleanupWorkDir, produceClipFromFile } from "./produce.js";
+import { describeDrain, drainQueue } from "./render.js";
 
 const IRC_URL = "wss://irc-ws.chat.twitch.tv:443";
 
@@ -89,6 +90,10 @@ export class Collector {
   private liveRenders = 0;
   private reconcileTimer: NodeJS.Timeout | null = null;
   private reconciling = false;
+  private drainTimer: NodeJS.Timeout | null = null;
+  private draining = false;
+  /** Spikes that arrived while both live render slots were busy. */
+  private pendingLive: { login: string; ts: number; spikeId: string }[] = [];
 
   constructor(
     private api: ClipforgeApi,
@@ -114,6 +119,11 @@ export class Collector {
     // Live status changes during a long run, so buffers and chat joins are
     // reconciled periodically rather than decided once at startup.
     this.startReconcileLoop();
+
+    // Anything the live path could not cut (a burst that filled both render
+    // slots, a moment outside the ring buffer) still has to become a clip, and
+    // this job is the only one guaranteed to be running.
+    this.startDrainLoop();
 
     log(`collecting ${this.states.size} channel(s): ${[...this.states.keys()].join(", ")}`);
     await this.connect();
@@ -144,6 +154,7 @@ export class Collector {
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.detectTimer) clearInterval(this.detectTimer);
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    if (this.drainTimer) clearInterval(this.drainTimer);
     for (const recorder of this.recorders.values()) await recorder.stop();
     this.recorders.clear();
     await this.flushAll().catch((err) => log("final flush failed", String(err)));
@@ -390,6 +401,36 @@ export class Collector {
     this.reconcileTimer = setInterval(() => void this.reconcileBuffers(), 300_000);
   }
 
+  private startDrainLoop(): void {
+    if (!this.vod.configured) return;
+    // Not immediately: the first bursts of a run are the live path's job, and
+    // an archive VOD does not exist until a stream has ended anyway.
+    setTimeout(() => void this.drainQueuedWork(), 120_000);
+    this.drainTimer = setInterval(() => void this.drainQueuedWork(), 180_000);
+  }
+
+  /**
+   * Renders whatever is still queued from the archive VOD. Spikes younger than
+   * two minutes are left alone so this never races the live capture path.
+   */
+  private async drainQueuedWork(): Promise<void> {
+    if (this.draining || this.stopping || !this.vod.configured) return;
+    this.draining = true;
+    try {
+      const result = await drainQueue({
+        api: this.api,
+        vod: this.vod,
+        limit: 2,
+        minSpikeAgeSec: 120,
+      });
+      if (result.hadWork) log(`queue drain: ${describeDrain(result)}`);
+    } catch (err) {
+      log(`queue drain failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.draining = false;
+    }
+  }
+
   private bufferSeconds(): number {
     const settings = this.settings;
     return Math.max(
@@ -484,7 +525,15 @@ export class Collector {
     const settings = this.settings;
     if (!recorder || !settings) return;
     if (this.liveRenders >= 2) {
-      log("live render concurrency limit reached - spike left for the VOD renderer");
+      // The ring buffer still holds this moment for a couple of minutes, so the
+      // spike waits here instead of being dropped to the VOD path (which cannot
+      // help until the stream ends).
+      if (this.pendingLive.length < 20) {
+        this.pendingLive.push({ login: state.login, ts, spikeId });
+        log(`live render slots busy - queued ${state.login} moment for the next free slot`);
+      } else {
+        log("live render backlog full - spike left for the VOD renderer");
+      }
       return;
     }
     this.liveRenders++;
@@ -535,6 +584,23 @@ export class Collector {
     } finally {
       this.liveRenders--;
       if (workDir) await cleanupWorkDir(workDir);
+      this.runPendingLive();
+    }
+  }
+
+  /** Starts the next backlogged live cut now that a slot is free. */
+  private runPendingLive(): void {
+    if (this.stopping) return;
+    while (this.liveRenders < 2 && this.pendingLive.length) {
+      const next = this.pendingLive.shift()!;
+      const state = this.states.get(next.login);
+      if (!state || !this.recorders.has(next.login)) {
+        log(`dropped backlogged moment for ${next.login} - its buffer is gone, left for the VOD pass`);
+        continue;
+      }
+      // captureLive increments liveRenders synchronously before it first awaits,
+      // so the loop cannot overfill the slots.
+      void this.captureLive(state, next.ts, next.spikeId);
     }
   }
 
