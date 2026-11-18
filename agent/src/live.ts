@@ -29,12 +29,20 @@ export class LiveRecorder {
   private stopping = false;
   private lastError = "";
   private dir: string;
+  /** consecutive failed respawns, reset once ffmpeg has run for a while */
+  private failures = 0;
+  private startedAt = 0;
 
   constructor(
     readonly login: string,
     private playlistUrl: string,
     /** how much footage to retain, seconds */
     private bufferSeconds = 180,
+    /**
+     * Re-signs the playlist. Twitch's HLS URL carries a short-lived token, so a
+     * restart must fetch a new one instead of replaying the dead URL.
+     */
+    private refreshUrl?: () => Promise<string>,
   ) {
     this.dir = path.join(tmpdir(), `clipforge-buf-${login}`);
     this.playlistUrl = playlistUrl;
@@ -49,6 +57,8 @@ export class LiveRecorder {
 
   private spawn(): void {
     if (this.stopping) return;
+    this.startedAt = Date.now();
+    this.lastError = "";
     const proc = spawn(
       "ffmpeg",
       [
@@ -75,11 +85,37 @@ export class LiveRecorder {
 
     proc.on("close", () => {
       if (this.stopping) return;
-      log(`live buffer for ${this.login} exited, restarting: ${this.lastError}`);
-      this.restart = setTimeout(() => this.spawn(), 3000);
+      // An expired token fails immediately, so a long run means the fault was
+      // transient; a short one means the URL itself has to be replaced.
+      if (Date.now() - this.startedAt > 60_000) this.failures = 0;
+      this.failures = Math.min(this.failures + 1, 6);
+      const delay = Math.min(60_000, 3_000 * 2 ** (this.failures - 1));
+      log(
+        `live buffer for ${this.login} exited, retrying in ${delay}ms` +
+          (this.lastError ? `: ${redactUrl(this.lastError)}` : ""),
+      );
+      this.restart = setTimeout(() => void this.restartNow(), delay);
     });
 
     this.proc = proc;
+  }
+
+  /** Refresh the signed URL before respawning, so a 404 is not replayed forever. */
+  private async restartNow(): Promise<void> {
+    if (this.stopping) return;
+    if (this.failures >= 2 && this.refreshUrl) {
+      try {
+        this.playlistUrl = await this.refreshUrl();
+        log(`live buffer for ${this.login}: playlist token refreshed`);
+      } catch (err) {
+        log(
+          `live buffer for ${this.login}: playlist refresh failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    this.spawn();
   }
 
   private async cleanup(): Promise<void> {
@@ -157,6 +193,11 @@ export class LiveRecorder {
 }
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Signed playlist URLs carry a short-lived token; keep it out of the log. */
+function redactUrl(text: string): string {
+  return text.replace(/https?:\/\/\S+/g, (url) => url.replace(/\?.*$/, "?…")).slice(-240);
+}
 
 /**
  * Segments whose *completion* time falls inside the window. A segment's mtime is

@@ -434,7 +434,12 @@ export class Collector {
         if (this.recorders.has(login)) continue;
         try {
           const playlist = await this.vod.livePlaylist(channel.login);
-          const recorder = new LiveRecorder(channel.login, playlist, this.bufferSeconds());
+          const recorder = new LiveRecorder(
+            channel.login,
+            playlist,
+            this.bufferSeconds(),
+            () => this.vod.livePlaylist(channel.login),
+          );
           await recorder.start();
           this.recorders.set(login, recorder);
         } catch (err) {
