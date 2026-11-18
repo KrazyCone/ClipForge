@@ -97,7 +97,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     await d.prepare("UPDATE spikes SET status = 'analyzing' WHERE id = ?").bind(id).run();
 
-    const windowStartSec = Math.max(-30, Math.min(0, Number(body.windowStartSec) || 0));
+    // Older agents do not send this. Their sampled audio starts fifteen seconds
+    // before the spike, which is a better default than 0.
+    const windowStartSec =
+      body.windowStartSec === undefined
+        ? -15
+        : Math.max(-30, Math.min(0, Number(body.windowStartSec) || 0));
     const loudnessBucketSec = Math.max(0.2, Math.min(2, Number(body.loudnessBucketSec) || 0.5));
     const loudness = (body.loudness ?? [])
       .slice(0, 200)

@@ -109,6 +109,32 @@ async function runModel(e: Env, model: string, body: unknown): Promise<unknown> 
   return (await res.json()) as unknown;
 }
 
+/** Some Whisper responses only carry WebVTT; recover segment timings from it. */
+function parseVtt(vtt: string): SpokenSegment[] {
+  const toSeconds = (value: string): number => {
+    const [h, m, s] = value.split(":");
+    return Number(h) * 3600 + Number(m) * 60 + Number(String(s).replace(",", "."));
+  };
+  const out: SpokenSegment[] = [];
+  for (const block of vtt.replace(/\r/g, "").split(/\n\n+/)) {
+    const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+    const timing = lines.find((line) => line.includes("-->") && line.includes(":"));
+    if (!timing) continue;
+    const [from, to] = timing.split("-->").map((part) => part.trim().split(/\s+/)[0]);
+    const text = lines
+      .filter((line) => !line.includes("-->") && !/^\d+$/.test(line) && line !== "WEBVTT")
+      .join(" ")
+      .replace(/<[^>]+>/g, "")
+      .trim();
+    if (!text) continue;
+    const startSec = toSeconds(from);
+    const endSec = toSeconds(to);
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec) || endSec <= startSec) continue;
+    out.push({ startSec, endSec, text });
+  }
+  return out;
+}
+
 /** Speech-to-text via Workers AI Whisper. Returns "" when unavailable. */
 export async function transcribe(
   e: Env,
@@ -124,9 +150,10 @@ export async function transcribe(
       result?: {
         text?: string;
         segments?: { start?: number; end?: number; text?: string }[];
+        vtt?: string;
       };
     };
-    const segments = Array.isArray(json.result?.segments)
+    const parsedSegments = Array.isArray(json.result?.segments)
       ? json.result.segments
           .map((s) => ({
             startSec: Number(s.start),
@@ -137,6 +164,10 @@ export async function transcribe(
             (s) => s.text && Number.isFinite(s.startSec) && Number.isFinite(s.endSec) && s.endSec > s.startSec,
           )
       : [];
+    const segments =
+      parsedSegments.length || typeof json.result?.vtt !== "string"
+        ? parsedSegments
+        : parseVtt(json.result.vtt);
     return { text: (json.result?.text ?? "").trim(), segments, provider: model };
   } catch (err) {
     // A silent failure here means a clip with no spoken subtitles and no
