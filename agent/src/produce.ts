@@ -38,8 +38,10 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
   // file, which makes ffmpeg write an empty clip. Keep it inside the footage.
   const latestStart = Math.max(0, (opts.sourceDurationSec ?? Number.POSITIVE_INFINITY) - 2);
   const startInSource = Math.max(0, Math.min(startOffset - sourceStartSec, latestStart));
+  // Beat times are already source-file offsets, so the limit is the file's
+  // total length, not what remains after startInSource.
   const available = opts.sourceDurationSec
-    ? Math.max(0, opts.sourceDurationSec - startInSource)
+    ? Math.max(0, opts.sourceDurationSec)
     : Number.POSITIVE_INFINITY;
 
   // Beat times are relative to the spike; the source file starts at
