@@ -6,7 +6,7 @@ import { rm, writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { renderClip, thumbnail, extractAudio, sampleFrames } from "./ffmpeg.js";
 import { buildAss, buildCaptionAss } from "./subtitles.js";
-import type { AgentSettings, QueueClip } from "./api.js";
+import type { AgentSettings, AnalyzeResult, QueueClip } from "./api.js";
 import type { ClipforgeApi } from "./api.js";
 import { log } from "./config.js";
 
@@ -17,6 +17,8 @@ export interface ProduceOptions {
   sourceFile: string;
   /** wall-clock unix seconds of the source file's first frame */
   sourceStartSec: number;
+  /** length of the source file, used to clamp the cut inside it */
+  sourceDurationSec?: number;
   settings: AgentSettings;
   workDir: string;
   /** transcript discovered during analysis, if any */
@@ -28,7 +30,10 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
 
   const startOffset = clip.start_offset ?? sourceStartSec;
   const endOffset = clip.end_offset ?? startOffset + settings.clipDurationSec;
-  const startInSource = Math.max(0, startOffset - sourceStartSec);
+  // A segment-timing estimate can place the cut a little past the end of the
+  // file, which makes ffmpeg write an empty clip. Keep it inside the footage.
+  const latestStart = Math.max(0, (opts.sourceDurationSec ?? Number.POSITIVE_INFINITY) - 2);
+  const startInSource = Math.max(0, Math.min(startOffset - sourceStartSec, latestStart));
   const duration = Math.max(6, Math.min(60, endOffset - startOffset));
 
   const transcript = opts.transcript ?? "";
@@ -74,23 +79,30 @@ export async function analyseLocal(
   durationSec: number,
   frameSampleFps: number,
   workDir: string,
-): Promise<{
-  clipId?: string;
-  transcript: string;
-  clip?: { id: string; caption: string | null; title: string | null; start_offset: number | null; end_offset: number | null };
-} | null> {
-  const frames = await sampleFrames(file, startSec, durationSec, frameSampleFps, workDir);
-  const audio = await extractAudio(file, startSec, durationSec, workDir);
+): Promise<AnalyzeResult | null> {
+  // Frames and audio are independent: a snapshot that ffmpeg cannot seek into
+  // used to abort the whole capture, even though the audio alone is enough to
+  // judge the moment. Each half degrades on its own now.
+  let frames: Buffer[] = [];
+  try {
+    frames = await sampleFrames(file, startSec, durationSec, frameSampleFps, workDir);
+  } catch (err) {
+    log(`frame sampling failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+  }
+
+  let audio: Buffer | null = null;
+  try {
+    audio = await extractAudio(file, startSec, durationSec, workDir);
+  } catch {
+    audio = null;
+  }
+
   if (!frames.length && !audio) return null;
 
-  const result = await api.analyze(spikeId, {
+  return api.analyze(spikeId, {
     frames: frames.map((f) => f.toString("base64")),
     audioBase64: audio ? audio.toString("base64") : undefined,
   });
-
-  const transcript = result.transcript ?? "";
-  if (result.skipped || !result.clipId || !result.clip) return { transcript };
-  return { clipId: result.clipId, transcript, clip: result.clip };
 }
 
 export async function cleanupWorkDir(dir: string): Promise<void> {

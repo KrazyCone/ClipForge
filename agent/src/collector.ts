@@ -646,8 +646,17 @@ export class Collector {
       }
       snapDir = snap.workDir;
 
-      const startInSnap = Math.max(0, ts - settings.preEventSec - snap.startSec);
-      const window = Math.min(45, settings.preEventSec + settings.postEventSec + 12);
+      // The snapshot's wall-clock anchor is estimated from segment times, so
+      // keep the offsets inside the footage that was actually written.
+      const startInSnap = Math.max(
+        0,
+        Math.min(ts - settings.preEventSec - snap.startSec, Math.max(0, snap.durationSec - 3)),
+      );
+      const window = Math.min(
+        45,
+        settings.preEventSec + settings.postEventSec + 12,
+        Math.max(2, snap.durationSec - startInSnap),
+      );
 
       workDir = await mkdtemp(path.join(tmpdir(), "clipforge-live-"));
       const analysis = await analyseLocal(
@@ -660,7 +669,19 @@ export class Collector {
         workDir,
       );
 
-      if (!analysis?.clipId || !analysis.clip) {
+      if (!analysis) {
+        log(`live analysis produced nothing for ${state.login} - no usable frames or audio in the snapshot`);
+        return;
+      }
+      if (analysis.skipped) {
+        const score = analysis.analysis?.qualityScore;
+        log(
+          `live analysis skipped ${state.login}: ${analysis.reason ?? "below the quality floor"}` +
+            (score === undefined ? "" : ` (score ${score}, floor ${settings.minQualityScore})`),
+        );
+        return;
+      }
+      if (!analysis.clipId || !analysis.clip) {
         log(`live analysis produced no clip for ${state.login}`);
         return;
       }
@@ -670,6 +691,7 @@ export class Collector {
         clip: analysis.clip,
         sourceFile: snap.file,
         sourceStartSec: snap.startSec,
+        sourceDurationSec: snap.durationSec,
         settings,
         workDir,
         transcript: analysis.transcript,

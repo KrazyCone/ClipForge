@@ -200,7 +200,13 @@ export class LiveRecorder {
     const out = path.join(work, "moment.ts");
     try {
       await ffmpeg(
-        ["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-y", out],
+        [
+          "-hide_banner", "-loglevel", "error",
+          // Segments were written with reset timestamps, so regenerate them for
+          // the concatenated file or seeking into it lands on nothing.
+          "-fflags", "+genpts",
+          "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-y", out,
+        ],
         60_000,
       );
     } catch (err) {
@@ -208,8 +214,17 @@ export class LiveRecorder {
       return null;
     }
 
-    let duration = 0;
-    for (const p of picked) duration += await ffprobeDuration(p.full);
+    // Probe what was actually written: summing the per-segment durations drifts
+    // from the concatenated file, and callers use this to clamp their offsets.
+    let duration = await ffprobeDuration(out);
+    if (duration <= 0) {
+      // Some TS containers report no format duration; sum the parts instead.
+      for (const p of picked) duration += await ffprobeDuration(p.full);
+    }
+    if (duration <= 0) {
+      log(`snapshot for ${this.login} produced no decodable duration`);
+      return null;
+    }
 
     return { file: out, startSec, durationSec: duration, workDir: work };
   }

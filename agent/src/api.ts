@@ -68,6 +68,13 @@ export interface AnalyzeResult {
   reason?: string;
   transcript?: string;
   clip?: AnalyzedClip;
+  analysis?: {
+    qualityScore: number;
+    funniness: number;
+    interesting: boolean;
+    category: string;
+    provider: string;
+  };
 }
 
 export interface QueueResponse {
