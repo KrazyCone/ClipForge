@@ -412,8 +412,28 @@ export class Collector {
         live.channels.map((c) => [c.login.toLowerCase(), c] as const),
       );
 
+      // The cap applies for the whole run, not just at startup: a long run can
+      // see more channels go live than MAX_CHANNELS allows.
+      const cap = Math.min(this.cfg.maxChannels, this.settings?.maxChannels ?? this.cfg.maxChannels);
+      let capped = false;
       for (const channel of live.channels) {
+        if (channel.capture_mode === "none") continue;
+        if (this.states.size >= cap) {
+          capped = true;
+          break;
+        }
         this.addChannel(channel);
+      }
+      if (capped) {
+        log(`channel cap ${cap} reached - not joining further live channels this run`);
+      }
+
+      // A channel paused (monitor = 0) or removed mid-run must stop counting.
+      for (const login of [...this.states.keys()]) {
+        if (monitored.has(login)) continue;
+        this.states.delete(login);
+        if (this.joined.delete(login)) this.ws?.send(`PART #${login}`);
+        log(`stopped collecting #${login} (paused or removed)`);
       }
 
       // Stop buffering channels that went offline or were removed.

@@ -34,6 +34,11 @@ function usherQuery(token: { value: string; signature: string }): string {
   );
 }
 
+interface AccessToken {
+  value: string;
+  signature: string;
+}
+
 export interface TwitchVideo {
   id: string;
   user_id: string;
@@ -125,75 +130,103 @@ export class TwitchVod {
     return null;
   }
 
+  /** Playback access token for the public web player. */
+  private async playbackToken(variables: Record<string, unknown>): Promise<AccessToken> {
+    const res = await fetch(GQL, {
+      method: "POST",
+      headers: { "Client-Id": WEB_CLIENT_ID, "content-type": "application/json" },
+      body: JSON.stringify({
+        operationName: "PlaybackAccessToken",
+        variables,
+        extensions: {
+          persistedQuery: {
+            version: 1,
+            sha256Hash: "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712",
+          },
+        },
+      }),
+    });
+    if (!res.ok) throw new Error(`gql playback token ${res.status}: ${(await res.text()).slice(0, 120)}`);
+    const json = (await res.json()) as {
+      data?: {
+        streamPlaybackAccessToken?: AccessToken | null;
+        videoPlaybackAccessToken?: AccessToken | null;
+      };
+    };
+    const token = json.data?.streamPlaybackAccessToken ?? json.data?.videoPlaybackAccessToken;
+    if (!token) throw new Error("no playback token - the channel may be offline or the VOD restricted");
+    return token;
+  }
+
+  /**
+   * Fetch a usher master playlist, trying several endpoint shapes.
+   *
+   * Twitch has served both `/api/channel/hls` and `/api/v2/channel/hls` over the
+   * last year, and its edge answers a request it dislikes with a bare 403 whose
+   * body is the only clue. Every failed attempt is logged with the status, the
+   * edge node and the body so a blocked runner IP can be told apart from a bad
+   * token without guessing.
+   */
+  private async fetchMaster(kind: string, paths: string[], token: AccessToken): Promise<string> {
+    let last = "no attempt made";
+    for (const path of paths) {
+      const res = await fetch(`${path}?${usherQuery(token)}`, { headers: PLAYER_HEADERS });
+      if (res.ok) return res.text();
+      const body = (await res.text().catch(() => ""))
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 140);
+      const edge = res.headers.get("server") ?? "";
+      last = `${res.status}${edge ? ` via ${edge}` : ""}${body ? `: ${body}` : " (empty body)"}`;
+      log(`usher ${new URL(path).pathname} (${kind}) -> ${last}`);
+    }
+    throw new Error(`${kind} usher ${last}`);
+  }
+
   /**
    * Signed HLS playlist for the *live* stream. This is the same public playback
    * path the Twitch web player uses - no DRM or access control is bypassed.
    * Only use it for channels you own or have permission to record.
    */
   async livePlaylist(login: string): Promise<string> {
-    const res = await fetch(GQL, {
-      method: "POST",
-      headers: { "Client-Id": WEB_CLIENT_ID, "content-type": "application/json" },
-      body: JSON.stringify({
-        operationName: "PlaybackAccessToken",
-        variables: {
-          isLive: true,
-          login: login.toLowerCase(),
-          isVod: false,
-          vodID: "",
-          playerType: "site",
-        },
-        extensions: {
-          persistedQuery: {
-            version: 1,
-            sha256Hash: "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712",
-          },
-        },
-      }),
-    });
-    if (!res.ok) throw new Error(`gql live ${res.status}`);
-    const json = (await res.json()) as {
-      data?: { streamPlaybackAccessToken?: { value: string; signature: string } };
-    };
-    const token = json.data?.streamPlaybackAccessToken;
-    if (!token) throw new Error("no live playback token - is the channel live?");
+    const channel = login.toLowerCase();
+    const paths = [
+      `https://usher.ttvnw.net/api/channel/hls/${channel}.m3u8`,
+      `https://usher.ttvnw.net/api/v2/channel/hls/${channel}.m3u8`,
+    ];
 
-    const master =
-      `https://usher.ttvnw.net/api/channel/hls/${login.toLowerCase()}.m3u8?` + usherQuery(token);
-
-    const mres = await fetch(master, { headers: PLAYER_HEADERS });
-    if (!mres.ok) throw new Error(`live usher ${mres.status}`);
-    return this.pickVariant(await mres.text());
+    let text: string;
+    try {
+      text = await this.fetchMaster(
+        "live",
+        paths,
+        await this.playbackToken({ isLive: true, login: channel, isVod: false, vodID: "", playerType: "site" }),
+      );
+    } catch (err) {
+      // An independently signed, embed-scoped token carries a different claim
+      // set and is accepted by edges that reject the site token.
+      log(`live playlist retry for ${channel} after: ${msg(err)}`);
+      text = await this.fetchMaster(
+        "live/embed",
+        paths,
+        await this.playbackToken({ isLive: true, login: channel, isVod: false, vodID: "", playerType: "embed" }),
+      );
+    }
+    return this.pickVariant(text);
   }
 
   /** Signed HLS playlist for a VOD, choosing the best variant up to 1080p. */
   async playlistFor(vodId: string): Promise<string> {
-    const res = await fetch(GQL, {
-      method: "POST",
-      headers: { "Client-Id": WEB_CLIENT_ID, "content-type": "application/json" },
-      body: JSON.stringify({
-        operationName: "PlaybackAccessToken",
-        variables: { isLive: false, login: "", isVod: true, vodID: vodId, playerType: "site" },
-        extensions: {
-          persistedQuery: {
-            version: 1,
-            sha256Hash: "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712",
-          },
-        },
-      }),
-    });
-    if (!res.ok) throw new Error(`gql ${res.status}`);
-    const json = (await res.json()) as {
-      data?: { videoPlaybackAccessToken?: { value: string; signature: string } };
-    };
-    const token = json.data?.videoPlaybackAccessToken;
-    if (!token) throw new Error("no playback token - the VOD may be restricted or deleted");
-
-    const master = `https://usher.ttvnw.net/vod/${vodId}.m3u8?` + usherQuery(token);
-
-    const mres = await fetch(master, { headers: PLAYER_HEADERS });
-    if (!mres.ok) throw new Error(`usher ${mres.status}`);
-    return this.pickVariant(await mres.text());
+    const paths = [
+      `https://usher.ttvnw.net/vod/${vodId}.m3u8`,
+      `https://usher.ttvnw.net/vod/v2/${vodId}.m3u8`,
+    ];
+    const text = await this.fetchMaster(
+      "vod",
+      paths,
+      await this.playbackToken({ isLive: false, login: "", isVod: true, vodID: vodId, playerType: "site" }),
+    );
+    return this.pickVariant(text);
   }
 
   /** Master playlist: pick the highest variant <= 1080p. */
@@ -217,6 +250,8 @@ export class TwitchVod {
     return bestUrl;
   }
 }
+
+const msg = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 export function parseDuration(d: string): number {
   const m = /(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/.exec(d ?? "");
