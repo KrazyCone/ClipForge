@@ -273,35 +273,41 @@ async function renderJoined(
   for (const segment of segments) {
     args.push(
       "-ss", Math.max(0, segment.startSec).toFixed(2),
-      "-t", segment.durationSec.toFixed(2),
+      // Read one second of slack and trim in the graph instead. `-t` on the
+      // input stops at a packet boundary, so each cut's audio could run a frame
+      // or two longer than its video and every join moved the audio later.
+      "-t", (segment.durationSec + 1).toFixed(2),
       "-i", opts.input,
     );
   }
 
-  // Every cut must share dimensions, sample aspect ratio and frame rate before
-  // concat accepts them. 1080p keeps the 9:16 foreground sharp.
-  const normalise =
-    "scale=1920:1080:force_original_aspect_ratio=decrease," +
-    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS";
+  // Every cut gets exactly its planned duration, for video and audio alike,
+  // with timestamps starting at zero. 1080p keeps the 9:16 foreground sharp.
   const chains: string[] = [];
-  const videoLabels: string[] = [];
-  const audioLabels: string[] = [];
+  const pairLabels: string[] = [];
   for (let i = 0; i < segments.length; i++) {
-    chains.push(`[${i}:v]${normalise}[v${i}]`);
-    videoLabels.push(`[v${i}]`);
+    const duration = segments[i].durationSec.toFixed(3);
+    chains.push(
+      `[${i}:v]setpts=PTS-STARTPTS,fps=30,trim=duration=${duration},setpts=PTS-STARTPTS,` +
+        `scale=1920:1080:force_original_aspect_ratio=decrease,` +
+        `pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v${i}]`,
+    );
+    pairLabels.push(`[v${i}]`);
     if (hasAudio) {
       chains.push(
-        `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${i}]`,
+        `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,` +
+          `atrim=duration=${duration},asetpts=PTS-STARTPTS,` +
+          `aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`,
       );
-      audioLabels.push(`[a${i}]`);
+      pairLabels.push(`[a${i}]`);
     }
   }
+  // One concat for both streams keeps their segment boundaries identical.
   chains.push(
-    `${videoLabels.join("")}concat=n=${segments.length}:v=1:a=0[vc]`,
+    hasAudio
+      ? `${pairLabels.join("")}concat=n=${segments.length}:v=1:a=1[vc][ac]`
+      : `${pairLabels.join("")}concat=n=${segments.length}:v=1:a=0[vc]`,
   );
-  if (hasAudio) {
-    chains.push(`${audioLabels.join("")}concat=n=${segments.length}:v=0:a=1[ac]`);
-  }
 
   const finalVideo = opts.assPath ? `${videoFilter},${assFilter(opts.assPath)}` : videoFilter;
   chains.push(`[vc]${finalVideo}[vout]`);
