@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Badge, Empty, Score, ago, fmtDuration } from "./ui";
 import {
   IconDownload,
@@ -8,12 +9,22 @@ import {
   IconPlay,
   IconRefresh,
   IconSparkle,
+  IconThumbDown,
+  IconThumbUp,
   IconTrash,
   IconX,
 } from "./icons";
-import type { Clip } from "@/lib/types";
+import { ClipFeedbackBox } from "./ClipFeedback";
+import { parseReasons, summariseFeedback } from "@/lib/feedback";
+import type {
+  ClipFeedback,
+  FeedbackSentiment,
+  FeedbackSuggestion,
+} from "@/lib/feedback";
+import type { AppSettings, Clip } from "@/lib/types";
 
 const SORTS = [
+  { key: "taste", label: "Your feedback" },
   { key: "newest", label: "Newest" },
   { key: "quality", label: "Highest quality" },
   { key: "funnest", label: "Funniest" },
@@ -25,23 +36,35 @@ const SORTS = [
 
 const SORT_MAP: Record<string, string> = { funnest: "funniest" };
 
+type TasteFilter = "all" | "like" | "dislike" | "unrated";
+
 export function ClipLibrary({
   initialClips,
   initialClipId,
   initialSpikeId,
+  initialFeedback,
+  settings,
 }: {
   initialClips: Clip[];
   initialClipId: string | null;
   initialSpikeId: string | null;
+  initialFeedback: ClipFeedback[];
+  settings: AppSettings;
 }) {
+  const router = useRouter();
   const [clips, setClips] = useState<Clip[]>(initialClips);
   const [sort, setSort] = useState("newest");
   const [filter, setFilter] = useState<string>("all");
+  const [taste, setTaste] = useState<TasteFilter>("all");
   const [open, setOpen] = useState<Clip | null>(
     initialClips.find((c) => c.id === initialClipId) ?? null,
   );
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [current, setCurrent] = useState<AppSettings>(settings);
+  const [feedback, setFeedback] = useState<Record<string, ClipFeedback>>(() =>
+    Object.fromEntries(initialFeedback.map((f) => [f.clip_id, f])),
+  );
 
   const load = useCallback(
     async (nextSort: string) => {
@@ -58,25 +81,142 @@ export function ClipLibrary({
     return () => clearTimeout(t);
   }, [toast]);
 
+  // While a re-cut is queued, refresh so the badge clears when the collector
+  // finishes and the card picks up the new render.
+  const rebuilding = clips.some((c) => c.rebuild_pending);
+  useEffect(() => {
+    if (!rebuilding) return;
+    const t = setInterval(() => {
+      void load(sort === "taste" ? "newest" : sort);
+    }, 60_000);
+    return () => clearInterval(t);
+  }, [rebuilding, sort, load]);
+
+  // Keep an open modal in step with refreshed clip data (queued re-cut, new render).
+  useEffect(() => {
+    if (!open) return;
+    const fresh = clips.find((c) => c.id === open.id);
+    if (
+      fresh &&
+      (fresh.rebuild_pending !== open.rebuild_pending ||
+        fresh.status !== open.status ||
+        fresh.r2_key !== open.r2_key)
+    ) {
+      setOpen(fresh);
+    }
+  }, [clips, open]);
+
   async function changeSort(value: string) {
     setSort(value);
-    await load(value);
+    // "Your feedback" ranks the clips already loaded, so it needs no round trip.
+    if (value !== "taste") await load(value);
   }
+
+  const summary = useMemo(
+    () => summariseFeedback(Object.values(feedback), current),
+    [feedback, current],
+  );
+
+  const counts = useMemo(
+    () => ({
+      all: clips.length,
+      like: clips.filter((c) => feedback[c.id]?.sentiment === "like").length,
+      dislike: clips.filter((c) => feedback[c.id]?.sentiment === "dislike").length,
+      unrated: clips.filter((c) => !feedback[c.id]).length,
+    }),
+    [clips, feedback],
+  );
 
   const visible = useMemo(() => {
     let out = clips;
     if (filter === "ready") out = out.filter((c) => c.status === "ready");
-    if (filter === "processing") out = out.filter((c) => c.status === "pending" || c.status === "rendering");
+    if (filter === "processing")
+      out = out.filter((c) => c.status === "pending" || c.status === "rendering");
     if (filter === "failed") out = out.filter((c) => c.status === "failed");
     if (filter.startsWith("ch:")) out = out.filter((c) => c.channel_login === filter.slice(3));
     if (filter.startsWith("game:")) out = out.filter((c) => c.game_name === filter.slice(5));
+
+    if (taste === "like") out = out.filter((c) => feedback[c.id]?.sentiment === "like");
+    if (taste === "dislike") out = out.filter((c) => feedback[c.id]?.sentiment === "dislike");
+    if (taste === "unrated") out = out.filter((c) => !feedback[c.id]);
+
+    if (sort === "taste") {
+      const rank = (c: Clip) =>
+        feedback[c.id]?.sentiment === "like"
+          ? 2
+          : feedback[c.id]?.sentiment === "dislike"
+            ? 0
+            : 1;
+      out = [...out].sort(
+        (a, b) =>
+          rank(b) - rank(a) || (b.quality_score ?? 0) - (a.quality_score ?? 0),
+      );
+    }
     return out;
-  }, [clips, filter]);
+  }, [clips, filter, taste, sort, feedback]);
 
   const channels = useMemo(
     () => [...new Set(clips.map((c) => c.channel_login).filter(Boolean))] as string[],
     [clips],
   );
+
+  async function vote(clip: Clip, sentiment: FeedbackSentiment) {
+    const existing = feedback[clip.id];
+    setBusy(clip.id);
+    const res = await fetch(`/api/clips/${clip.id}/feedback`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sentiment,
+        reasons: parseReasons(existing?.reasons_json),
+        note: existing?.note ?? "",
+      }),
+    });
+    const data = (await res.json()) as { feedback?: ClipFeedback; error?: string };
+    if (res.ok && data.feedback) {
+      setFeedback((prev) => ({ ...prev, [clip.id]: data.feedback! }));
+      setToast(sentiment === "like" ? "Liked — more like this" : "Disliked — less like this");
+    } else {
+      setToast(data.error ?? "Could not save feedback");
+    }
+    setBusy(null);
+  }
+
+  async function rebuild(clip: Clip) {
+    setBusy(clip.id);
+    const res = await fetch(`/api/clips/${clip.id}/rebuild`, { method: "POST" });
+    const data = (await res.json()) as { ok?: boolean; queued?: boolean; error?: string };
+    if (res.ok) {
+      // The clip stays playable, but the card shows the re-cut is waiting.
+      setClips((prev) =>
+        prev.map((c) => (c.id === clip.id ? { ...c, rebuild_pending: 1 } : c)),
+      );
+      setOpen((prev) =>
+        prev && prev.id === clip.id ? { ...prev, rebuild_pending: 1 } : prev,
+      );
+      setToast("Queued — the collector re-cuts this clip on its next pass");
+      await load(sort === "taste" ? "newest" : sort);
+    } else {
+      setToast(data.error ?? "Could not queue the rebuild");
+    }
+    setBusy(null);
+  }
+
+  async function applySuggestion(patch: Partial<AppSettings>) {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const data = (await res.json()) as { settings?: AppSettings; error?: string };
+    if (res.ok && data.settings) {
+      setCurrent(data.settings);
+      setToast("Filters updated from your feedback");
+      router.refresh();
+    } else {
+      setToast(data.error ?? "Could not update filters");
+    }
+  }
 
   async function remove(clip: Clip) {
     if (!confirm(`Delete this clip? The video file is removed from storage.`)) return;
@@ -159,7 +299,7 @@ export function ClipLibrary({
 
   return (
     <>
-      <div className="spread" style={{ marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+      <div className="spread" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
         <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
           {[
             { key: "all", label: `All ${clips.length}` },
@@ -194,102 +334,166 @@ export function ClipLibrary({
         </select>
       </div>
 
+      <div
+        className="row"
+        style={{ gap: 6, flexWrap: "wrap", marginBottom: 14 }}
+      >
+        <span className="faint" style={{ fontSize: 11 }}>
+          Your feedback
+        </span>
+        {[
+          { key: "all" as TasteFilter, label: "All" },
+          { key: "like" as TasteFilter, label: `Liked ${counts.like}` },
+          { key: "dislike" as TasteFilter, label: `Disliked ${counts.dislike}` },
+          { key: "unrated" as TasteFilter, label: `Unrated ${counts.unrated}` },
+        ].map((f) => (
+          <button
+            key={f.key}
+            className={`btn sm ${taste === f.key ? "primary" : "ghost"}`}
+            onClick={() => setTaste(f.key)}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
       {visible.length === 0 ? (
         <div className="panel">
           <Empty icon={<IconFilm />} title="No clips match this filter" />
         </div>
       ) : (
         <div className="clip-grid">
-          {visible.map((clip) => (
-            <article key={clip.id} className="clip-card">
-              <div className="clip-thumb" onClick={() => setOpen(clip)}>
-                {clip.thumb_key ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={`/api/media/${clip.thumb_key}`} alt={clip.caption ?? ""} loading="lazy" />
-                ) : (
-                  <div className="placeholder">
-                    {clip.status === "failed" ? "render failed" : "processing…"}
+          {visible.map((clip) => {
+            const reaction = feedback[clip.id];
+            return (
+              <article key={clip.id} className="clip-card">
+                <div className="clip-thumb" onClick={() => setOpen(clip)}>
+                  {clip.thumb_key ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={`/api/media/${clip.thumb_key}`} alt={clip.caption ?? ""} loading="lazy" />
+                  ) : (
+                    <div className="placeholder">
+                      {clip.status === "failed" ? "render failed" : "processing…"}
+                    </div>
+                  )}
+                  <div className="clip-thumb-top">
+                    <Badge
+                      tone={
+                        clip.status === "ready"
+                          ? "neutral"
+                          : clip.status === "failed"
+                            ? "red"
+                            : "amber"
+                      }
+                    >
+                      {clip.status}
+                    </Badge>
+                    {clip.quality_score !== null ? (
+                      <span
+                        className="badge"
+                        style={{ background: "rgba(0,0,0,0.6)", borderColor: "transparent" }}
+                      >
+                        <Score value={clip.quality_score} />
+                      </span>
+                    ) : null}
                   </div>
-                )}
-                <div className="clip-thumb-top">
-                  <Badge
-                    tone={
-                      clip.status === "ready"
-                        ? "neutral"
-                        : clip.status === "failed"
-                          ? "red"
-                          : "amber"
-                    }
-                  >
-                    {clip.status}
-                  </Badge>
-                  {clip.quality_score !== null ? (
-                    <span
-                      className="badge"
-                      style={{ background: "rgba(0,0,0,0.6)", borderColor: "transparent" }}
-                    >
-                      <Score value={clip.quality_score} />
+                  <span className="clip-duration">{fmtDuration(clip.duration_ms)}</span>
+                </div>
+                <div className="clip-body">
+                  <div className="clip-caption" style={{ minHeight: 34 }}>
+                    {clip.caption ?? clip.title ?? "Untitled"}
+                  </div>
+                  <div className="clip-meta">
+                    <span className="truncate" style={{ maxWidth: "100%" }}>
+                      {clip.channel_name} · {clip.game_name ?? "—"}
                     </span>
-                  ) : null}
-                </div>
-                <span className="clip-duration">{fmtDuration(clip.duration_ms)}</span>
-              </div>
-              <div className="clip-body">
-                <div className="clip-caption" style={{ minHeight: 34 }}>
-                  {clip.caption ?? clip.title ?? "Untitled"}
-                </div>
-                <div className="clip-meta">
-                  <span className="truncate" style={{ maxWidth: "100%" }}>
-                    {clip.channel_name} · {clip.game_name ?? "—"}
-                  </span>
-                  <span className="faint">{ago(clip.created_at)}</span>
-                </div>
-                <div className="clip-actions">
-                  <button className="btn sm ghost icon" title="Play" onClick={() => setOpen(clip)}>
-                    <IconPlay width={12} height={12} />
-                  </button>
-                  {clip.status === "ready" ? (
-                    <a
+                    <span className="faint">{ago(clip.created_at)}</span>
+                    {reaction ? (
+                      <Badge tone={reaction.sentiment === "like" ? "green" : "red"}>
+                        {reaction.sentiment === "like" ? "liked" : "disliked"}
+                      </Badge>
+                    ) : null}
+                    {clip.rebuild_pending ? <Badge tone="amber">re-cut queued</Badge> : null}
+                  </div>
+                  <div className="clip-actions">
+                    <button className="btn sm ghost icon" title="Play" onClick={() => setOpen(clip)}>
+                      <IconPlay width={12} height={12} />
+                    </button>
+                    {clip.status === "ready" ? (
+                      <a
+                        className="btn sm ghost icon"
+                        title="Download"
+                        href={`/api/clips/${clip.id}/download`}
+                      >
+                        <IconDownload width={12} height={12} />
+                      </a>
+                    ) : null}
+                    <button
                       className="btn sm ghost icon"
-                      title="Download"
-                      href={`/api/clips/${clip.id}/download`}
+                      title="Regenerate caption"
+                      disabled={busy === clip.id}
+                      onClick={() => regenerate(clip)}
                     >
-                      <IconDownload width={12} height={12} />
-                    </a>
-                  ) : null}
-                  <button
-                    className="btn sm ghost icon"
-                    title="Regenerate caption"
-                    disabled={busy === clip.id}
-                    onClick={() => regenerate(clip)}
-                  >
-                    <IconSparkle width={12} height={12} />
-                  </button>
-                  <button
-                    className="btn sm ghost icon"
-                    title="Delete"
-                    disabled={busy === clip.id}
-                    onClick={() => remove(clip)}
-                    style={{ marginLeft: "auto" }}
-                  >
-                    <IconTrash width={12} height={12} />
-                  </button>
+                      <IconSparkle width={12} height={12} />
+                    </button>
+                    <button
+                      className="btn sm ghost icon"
+                      title="Like this clip"
+                      aria-pressed={reaction?.sentiment === "like"}
+                      disabled={busy === clip.id}
+                      onClick={() => vote(clip, "like")}
+                      style={reaction?.sentiment === "like" ? { color: "var(--accent-ink)", background: "var(--accent)" } : undefined}
+                    >
+                      <IconThumbUp width={12} height={12} />
+                    </button>
+                    <button
+                      className="btn sm ghost icon"
+                      title="Dislike this clip"
+                      aria-pressed={reaction?.sentiment === "dislike"}
+                      disabled={busy === clip.id}
+                      onClick={() => vote(clip, "dislike")}
+                      style={reaction?.sentiment === "dislike" ? { color: "#efb0b0", border: "1px solid rgba(224,82,82,0.55)" } : undefined}
+                    >
+                      <IconThumbDown width={12} height={12} />
+                    </button>
+                    <button
+                      className="btn sm ghost icon"
+                      title="Delete"
+                      disabled={busy === clip.id}
+                      onClick={() => remove(clip)}
+                      style={{ marginLeft: "auto" }}
+                    >
+                      <IconTrash width={12} height={12} />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            </article>
-          ))}
+              </article>
+            );
+          })}
         </div>
       )}
 
       {open ? (
         <ClipModal
           clip={open}
+          feedback={feedback[open.id] ?? null}
           busy={busy === open.id}
           onClose={() => setOpen(null)}
           onDelete={() => remove(open)}
           onRegenerate={() => regenerate(open)}
           onReprocess={() => reprocess(open)}
           onSave={(title, caption) => saveEdit(open, title, caption)}
+          suggestion={summary.suggestion}
+          onRebuild={() => rebuild(open)}
+          onApplySuggestion={applySuggestion}
+          onFeedback={(next) =>
+            setFeedback((prev) => {
+              const copy = { ...prev };
+              if (next) copy[open.id] = next;
+              else delete copy[open.id];
+              return copy;
+            })
+          }
         />
       ) : null}
 
@@ -300,20 +504,30 @@ export function ClipLibrary({
 
 function ClipModal({
   clip,
+  feedback,
   busy,
+  suggestion,
   onClose,
   onDelete,
   onRegenerate,
   onReprocess,
   onSave,
+  onRebuild,
+  onApplySuggestion,
+  onFeedback,
 }: {
   clip: Clip;
+  feedback: ClipFeedback | null;
   busy: boolean;
+  suggestion: FeedbackSuggestion | null;
   onClose: () => void;
   onDelete: () => void;
   onRegenerate: () => void;
   onReprocess: () => void;
   onSave: (title: string, caption: string) => void;
+  onRebuild: () => void;
+  onApplySuggestion: (patch: Partial<AppSettings>) => void;
+  onFeedback: (feedback: ClipFeedback | null) => void;
 }) {
   const [title, setTitle] = useState(clip.title ?? "");
   const [caption, setCaption] = useState(clip.caption ?? "");
@@ -325,6 +539,7 @@ function ClipModal({
         <button className="btn icon ghost modal-close" onClick={onClose} aria-label="Close">
           <IconX width={14} height={14} />
         </button>
+        <div className="modal-media">
         <div className="modal-video">
           {clip.r2_key && clip.status === "ready" ? (
             <video
@@ -341,6 +556,45 @@ function ClipModal({
                 : "This clip is still being rendered."}
             </div>
           )}
+        </div>
+
+        <div className="modal-suggest">
+          <div className="spread" style={{ gap: 8 }}>
+            <span className="setting-label">Suggestion</span>
+            {suggestion ? <Badge tone="neutral">from your feedback</Badge> : null}
+          </div>
+          {suggestion ? (
+            <>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>{suggestion.headline}</div>
+              <div className="setting-hint">{suggestion.detail}</div>
+              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                <button
+                  className="btn sm primary"
+                  disabled={busy || Boolean(clip.rebuild_pending)}
+                  onClick={onRebuild}
+                >
+                  <IconRefresh width={12} height={12} />{" "}
+                  {clip.rebuild_pending ? "Re-cut queued" : "Regenerate this clip"}
+                </button>
+                <button
+                  className="btn sm"
+                  onClick={() => onApplySuggestion(suggestion.patch)}
+                >
+                  Apply to all other clips
+                </button>
+              </div>
+              <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                {clip.rebuild_pending
+                  ? "Queued — waiting for the collector. The current cut stays playable until the new one replaces it."
+                  : "Regenerate re-cuts only this clip with the suggestion. Apply saves it as the default for every other clip and for new moments."}
+              </div>
+            </>
+          ) : (
+            <div className="setting-hint">
+              Like or dislike a few clips and a suggestion for better cuts shows up here.
+            </div>
+          )}
+        </div>
         </div>
 
         <div className="modal-info">
@@ -362,6 +616,8 @@ function ClipModal({
               spike intensity
             </div>
           </div>
+
+          <ClipFeedbackBox key={clip.id} clip={clip} value={feedback} onChange={onFeedback} />
 
           <div className="grid grid-2">
             <div className="field">

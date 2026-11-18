@@ -49,6 +49,8 @@ export async function PUT(req: Request) {
         return json({ error: "subtitleStyle must be bold, clean or karaoke" }, 400);
       }
       clean[key] = String(value);
+    } else if (key === "clipDirection") {
+      clean[key] = String(value ?? "").slice(0, 1200);
     }
   }
 

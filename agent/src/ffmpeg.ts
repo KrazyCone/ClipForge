@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import type { WebcamBox } from "./webcam.js";
 
 /**
  * Fonts are installed next to ffmpeg in the workflow image. Passing the
@@ -194,6 +195,10 @@ export interface RenderOptions {
   aspect: "9:16" | "1:1" | "16:9";
   cropMode: "blur" | "center";
   cropX?: "center" | "left" | "right";
+  /** detected face cam, normalized to the source frame */
+  webcam?: WebcamBox | null;
+  /** stack an enlarged webcam band above the gameplay */
+  focusWebcam?: boolean;
 }
 
 /**
@@ -222,14 +227,20 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
   }
 
   const segments = (opts.segments ?? []).filter((s) => s.durationSec >= 1);
+  // The stacked layout is built for the vertical canvas only.
+  const webcam = opts.focusWebcam && opts.webcam && opts.aspect === "9:16" ? opts.webcam : null;
 
   if (segments.length > 1) {
-    await renderJoined(opts, segments, videoFilter);
+    await renderJoined(opts, segments, videoFilter, webcam);
     return;
   }
 
-  if (opts.assPath) {
-    videoFilter += `,${assFilter(opts.assPath)}`;
+  let filterComplex: string;
+  if (webcam) {
+    filterComplex = webcamChains("0:v", webcam, "v", opts.assPath).join(";");
+  } else {
+    if (opts.assPath) videoFilter += `,${assFilter(opts.assPath)}`;
+    filterComplex = `[0:v]${videoFilter}[v]`;
   }
 
   await ffmpeg([
@@ -238,7 +249,7 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     "-ss", opts.startSec.toFixed(2),
     "-t", opts.durationSec.toFixed(2),
     "-i", opts.input,
-    "-filter_complex", `[0:v]${videoFilter}[v]`,
+    "-filter_complex", filterComplex,
     "-map", "[v]",
     "-map", "0:a?",
     "-c:v", "libx264",
@@ -263,10 +274,35 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
  * The vertical/blur treatment is applied once after the join, and the subtitle
  * file covers the joined timeline.
  */
+/**
+ * Face-forward layout: the webcam crop fills a 1080x860 band at the top and the
+ * whole gameplay frame sits below it over a blurred fill, so the face is much
+ * larger without losing the play. Subtitles burn over the gameplay half.
+ */
+function webcamChains(
+  source: string,
+  box: WebcamBox,
+  outLabel: string,
+  assPath: string | null,
+): string[] {
+  const f = (n: number) => n.toFixed(4);
+  return [
+    `[${source}]split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
+    `[wcFaceSrc]crop=iw*${f(box.w)}:ih*${f(box.h)}:iw*${f(box.x)}:ih*${f(box.y)},` +
+      `scale=1080:860:force_original_aspect_ratio=increase,crop=1080:860,setsar=1[wcFace]`,
+    `[wcGameSrc]scale=1080:1060:force_original_aspect_ratio=decrease[wcGameFit]`,
+    `[wcBgSrc]scale=1080:1060:force_original_aspect_ratio=increase,crop=1080:1060,gblur=sigma=26[wcGameBg]`,
+    `[wcGameBg][wcGameFit]overlay=(W-w)/2:(H-h)/2[wcGame]`,
+    `[wcGame]pad=1080:1920:0:860:black[wcPadded]`,
+    `[wcPadded][wcFace]overlay=0:0${assPath ? `,${assFilter(assPath)}` : ""}[${outLabel}]`,
+  ];
+}
+
 async function renderJoined(
   opts: RenderOptions,
   segments: { startSec: number; durationSec: number }[],
   videoFilter: string,
+  webcam: WebcamBox | null,
 ): Promise<void> {
   const hasAudio = await ffprobeHasAudio(opts.input);
   const args = ["-hide_banner", "-loglevel", "error"];
@@ -309,8 +345,12 @@ async function renderJoined(
       : `${pairLabels.join("")}concat=n=${segments.length}:v=1:a=0[vc]`,
   );
 
-  const finalVideo = opts.assPath ? `${videoFilter},${assFilter(opts.assPath)}` : videoFilter;
-  chains.push(`[vc]${finalVideo}[vout]`);
+  if (webcam) {
+    chains.push(...webcamChains("vc", webcam, "vout", opts.assPath));
+  } else {
+    const finalVideo = opts.assPath ? `${videoFilter},${assFilter(opts.assPath)}` : videoFilter;
+    chains.push(`[vc]${finalVideo}[vout]`);
+  }
 
   args.push("-filter_complex", chains.join(";"), "-map", "[vout]");
   if (hasAudio) args.push("-map", "[ac]");

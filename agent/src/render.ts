@@ -22,6 +22,7 @@ import type {
 import type { TwitchVod } from "./twitch.js";
 import { audioLoudness, extractAudio, renderClip, sampleFrames, thumbnail } from "./ffmpeg.js";
 import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
+import { parseWebcamBox } from "./webcam.js";
 
 /**
  * Twitch only publishes a broadcast as an archive VOD once the stream ends, so
@@ -189,6 +190,8 @@ async function renderClipJob(
     assPath,
     aspect: settings.aspectRatio,
     cropMode: "blur",
+    webcam: parseWebcamBox(clip.webcam_json),
+    focusWebcam: settings.webcamFocus === true,
   });
 
   const thumbPath = path.join(workDir, "thumb.jpg");

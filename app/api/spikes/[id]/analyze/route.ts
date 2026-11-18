@@ -1,5 +1,12 @@
-import { db, env, getSettings } from "@/lib/db";
-import { analyzeMoment, captionsForBeats, describeFrame, transcribe } from "@/lib/ai";
+import { db, ensureWebcamColumn, env, getSettings } from "@/lib/db";
+import {
+  analyzeMoment,
+  captionsForBeats,
+  describeFrame,
+  detectWebcam,
+  transcribe,
+} from "@/lib/ai";
+import { boxFromHint, storedWebcam } from "@/lib/webcam";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -37,9 +44,27 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const d = await db();
     const e = await env();
     const settings = await getSettings();
+    await ensureWebcamColumn(d);
 
     const spike = await d.prepare("SELECT * FROM spikes WHERE id = ?").bind(id).first<Spike>();
     if (!spike) return json({ error: "spike not found" }, 404);
+
+    // A single-clip rebuild stores the settings it should use on the spike, so
+    // the re-cut honours the suggestion without changing the saved defaults.
+    let override: { clipDurationSec?: number; minQualityScore?: number } = {};
+    try {
+      override = JSON.parse(spike.analyze_json ?? "{}") as typeof override;
+    } catch {
+      override = {};
+    }
+    const overrideDuration = Number(override.clipDurationSec);
+    const overrideFloor = Number(override.minQualityScore);
+    const effectiveDuration = Number.isFinite(overrideDuration)
+      ? Math.max(6, Math.min(60, overrideDuration))
+      : settings.clipDurationSec;
+    const effectiveFloor = Number.isFinite(overrideFloor)
+      ? Math.max(0, Math.min(95, overrideFloor))
+      : settings.minQualityScore;
 
     const channel = await d
       .prepare("SELECT * FROM channels WHERE id = ?")
@@ -77,6 +102,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       else if (result?.error && !visionError) visionError = result.error;
     }
 
+    // --- webcam layout ---------------------------------------------------
+    // One extra vision call per clip. If the model is unsure, the clip keeps
+    // the normal layout rather than guessing a crop.
+    let webcamJson: string | null = null;
+    if (settings.webcamFocus && frames.length > 0) {
+      const hint = await detectWebcam(
+        e,
+        frames[0],
+        `Game: ${channel?.game_name ?? "unknown"}. Channel: ${channel?.display_name ?? spike.channel_login}.`,
+      );
+      const box = boxFromHint(hint);
+      if (hint && box) webcamJson = storedWebcam(hint, box);
+    }
+
     // --- audio transcription --------------------------------------------
     let transcript = body.transcript ?? "";
     let sttProvider = "none";
@@ -108,7 +147,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .slice(0, 200)
       .map((v) => Number(v))
       .filter((v) => Number.isFinite(v));
-    const maxClipSec = Math.max(8, Math.min(60, settings.clipDurationSec));
+    const maxClipSec = Math.max(8, Math.min(60, effectiveDuration));
 
     const input: MomentInput = {
       channelName: channel?.display_name ?? spike.channel_login,
@@ -124,6 +163,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       loudnessBucketSec,
       transcriptSegments: segments,
       maxClipSec,
+      direction: settings.clipDirection,
     };
 
     const analysis = await analyzeMoment(e, input);
@@ -216,7 +256,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           visionError,
         }),
         analysis.provider,
-        analysis.qualityScore >= settings.minQualityScore ? "rendering" : "skipped",
+        analysis.qualityScore >= effectiveFloor ? "rendering" : "skipped",
         id,
       )
       .run();
@@ -224,27 +264,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // The score is the judgement; the model's separate `interesting` opinion is
     // not consulted, because it regularly contradicts the score it just gave
     // and silently threw away passing moments.
-    if (analysis.qualityScore < settings.minQualityScore) {
-      return json({
-        ok: true,
-        skipped: true,
-        reason: `quality ${analysis.qualityScore} below floor ${settings.minQualityScore}`,
-        analysis,
-        transcript,
-        sttError,
-      });
-    }
-
-    // Reuse an existing clip job for this spike rather than creating duplicates.
-    const existing = await d
-      .prepare("SELECT id FROM clips WHERE spike_id = ?")
-      .bind(id)
-      .first<{ id: string }>();
-    if (existing) {
-      return json({ ok: true, clipId: existing.id, analysis, existing: true, beats, captions, sttError });
-    }
-
-    const clipId = crypto.randomUUID();
     const now = new Date().toISOString();
     // The duration setting is the ceiling, not the target: the joined cuts are
     // as long as the beats are, never padded to fill it.
@@ -252,6 +271,81 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const durationSec = Math.max(6, Math.min(maxClipSec, assembledSec));
     const startOffset = Math.max(0, spike.ts_unix + beginsAt);
     const endOffset = startOffset + durationSec;
+    const outWidth =
+      settings.aspectRatio === "9:16" ? 1080 : settings.aspectRatio === "1:1" ? 1080 : 1920;
+    const outHeight =
+      settings.aspectRatio === "9:16" ? 1920 : settings.aspectRatio === "1:1" ? 1080 : 1080;
+
+    if (analysis.qualityScore < effectiveFloor) {
+      const stale = await d
+        .prepare("SELECT id FROM clips WHERE spike_id = ?")
+        .bind(id)
+        .first<{ id: string }>();
+      if (stale) {
+        await d
+          .prepare("UPDATE clips SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+          .bind(
+            `re-analysis scored ${analysis.qualityScore}, below floor ${effectiveFloor}`,
+            now,
+            stale.id,
+          )
+          .run();
+      }
+      await d.prepare("UPDATE spikes SET analyze_json = NULL WHERE id = ?").bind(id).run();
+      return json({
+        ok: true,
+        skipped: true,
+        reason: `quality ${analysis.qualityScore} below floor ${effectiveFloor}`,
+        analysis,
+        transcript,
+        sttError,
+      });
+    }
+
+    // Reuse the clip job for this spike rather than creating duplicates. On a
+    // rebuild this replaces the stored metadata and hands the clip back to the
+    // renderer with the freshly picked beats.
+    const existing = await d
+      .prepare("SELECT id FROM clips WHERE spike_id = ?")
+      .bind(id)
+      .first<{ id: string }>();
+    if (existing) {
+      await d
+        .prepare(
+          `UPDATE clips SET title = ?, caption = ?, description = ?, hashtags_json = ?,
+             quality_score = ?, funniness = ?, category = ?, duration_ms = ?, width = ?, height = ?,
+             provider = ?, model = ?, start_offset = ?, end_offset = ?, transcript = ?,
+             webcam_json = ?,
+             status = 'pending', error = NULL, r2_key = NULL, thumb_key = NULL, bytes = NULL,
+             updated_at = ?
+           WHERE id = ?`,
+        )
+        .bind(
+          analysis.title,
+          analysis.caption,
+          analysis.summary,
+          JSON.stringify(analysis.hashtags),
+          analysis.qualityScore,
+          analysis.funniness,
+          analysis.category,
+          Math.round(durationSec * 1000),
+          outWidth,
+          outHeight,
+          analysis.provider,
+          analysis.model,
+          startOffset,
+          endOffset,
+          transcript || null,
+          webcamJson,
+          now,
+          existing.id,
+        )
+        .run();
+      await d.prepare("UPDATE spikes SET analyze_json = NULL WHERE id = ?").bind(id).run();
+      return json({ ok: true, clipId: existing.id, analysis, existing: true, beats, captions, sttError });
+    }
+
+    const clipId = crypto.randomUUID();
 
     await d
       .prepare(
@@ -259,9 +353,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           (id, spike_id, channel_id, channel_login, channel_name, title, caption, description,
            hashtags_json, game_name, stream_title, quality_score, funniness, intensity, category,
            duration_ms, width, height, r2_key, thumb_key, bytes, status, error, provider, model,
-           source_ts, start_offset, end_offset, transcript, created_at, updated_at)
+           source_ts, start_offset, end_offset, transcript, webcam_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
-                 'pending', NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 'pending', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         clipId,
@@ -280,14 +374,15 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         spike.intensity,
         analysis.category,
         Math.round(durationSec * 1000),
-        settings.aspectRatio === "9:16" ? 1080 : settings.aspectRatio === "1:1" ? 1080 : 1920,
-        settings.aspectRatio === "9:16" ? 1920 : settings.aspectRatio === "1:1" ? 1080 : 1080,
+        outWidth,
+        outHeight,
         analysis.provider,
         analysis.model,
         spike.ts_unix,
         startOffset,
         endOffset,
         transcript || null,
+        webcamJson,
         now,
         now,
       )

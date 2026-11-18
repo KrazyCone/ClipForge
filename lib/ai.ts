@@ -14,6 +14,9 @@
 import type { Env } from "./db";
 import type { SpikeFeatures } from "./spike";
 import { heuristicQuality } from "./spike";
+import { captionDirectionSuffix, withDirection } from "./direction";
+import { normaliseHint } from "./webcam";
+import type { WebcamHint } from "./webcam";
 
 export interface MomentInput {
   channelName: string;
@@ -35,6 +38,8 @@ export interface MomentInput {
   transcriptSegments?: SpokenSegment[];
   /** ceiling for the assembled multi-cut clip */
   maxClipSec?: number;
+  /** the operator's standing direction for every clip (picks, title, caption) */
+  direction?: string;
   /** prior assessment summary, used when regenerating copy */
   summary?: string;
 }
@@ -173,6 +178,38 @@ export async function transcribe(
     // A silent failure here means a clip with no spoken subtitles and no
     // explanation; the caller records this on the spike.
     return { text: "", segments: [], provider: model, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Finds the streamer's face cam in one frame. The model answers with a coarse
+ * region and size rather than pixels: that is what it is reliable at, and it is
+ * enough to crop and enlarge the face. Returns null when AI is off or unsure.
+ */
+export async function detectWebcam(
+  e: Env,
+  jpegBase64: string,
+  context: string,
+): Promise<WebcamHint | null> {
+  if (!aiConfigured(e)) return null;
+  const model = e.VISION_MODEL || "@cf/meta/llama-3.2-11b-vision-instruct";
+  try {
+    const json = (await runModel(e, model, {
+      prompt:
+        "You inspect one frame of a Twitch stream. Is a real streamer webcam visible: a person's face in a small overlay, usually in a corner, separate from the game? " +
+        'Reply with JSON only, no prose: {"webcam":true,"region":"top-left|top-center|top-right|mid-left|mid-center|mid-right|bottom-left|bottom-center|bottom-right","size":"small|medium|large"}. ' +
+        "Use the region where the webcam overlay sits in the frame and its rough size. If there is no person's webcam, reply {\"webcam\":false}. " +
+        context,
+      image: jpegBase64,
+      max_tokens: 80,
+    })) as { result?: { description?: string; response?: string } };
+    const text = json.result?.description ?? json.result?.response ?? "";
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    return normaliseHint(JSON.parse(text.slice(start, end + 1)));
+  } catch {
+    return null;
   }
 }
 
@@ -560,10 +597,12 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
     .filter(Boolean)
     .join("\n");
 
+  const systemPrompt = withDirection(PROMPT, input.direction);
+
   try {
     const json = (await runModel(e, model, {
       messages: [
-        { role: "system", content: PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user", content: context },
       ],
       max_tokens: 420,
@@ -614,6 +653,7 @@ export async function regenerateCaption(
   e: Env,
   input: MomentInput,
   previous: string,
+  direction = "",
 ): Promise<{ caption: string; provider: string }> {
   if (!aiConfigured(e)) {
     const options = heuristicCaptions(input, "funny").filter((c) => c !== previous);
@@ -629,7 +669,8 @@ export async function regenerateCaption(
         {
           role: "system",
           content:
-            "Write one ALL-CAPS meme caption for a Twitch clip, under 60 characters, no hashtags, no quotes, no emoji unless it lands. Reply with the caption only.",
+            "Write one ALL-CAPS meme caption for a Twitch clip, under 60 characters, no hashtags, no quotes, no emoji unless it lands. Reply with the caption only." +
+            captionDirectionSuffix(direction),
         },
         {
           role: "user",

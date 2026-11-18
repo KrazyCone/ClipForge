@@ -4,6 +4,8 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Badge, fmtBytes } from "./ui";
 import { IconAlert, IconCheck, IconDatabase, IconSparkle } from "./icons";
+import { summariseFeedback } from "@/lib/feedback";
+import type { ClipFeedback } from "@/lib/feedback";
 import type { AppSettings } from "@/lib/types";
 import type { SystemStatus } from "@/lib/status";
 import type { Stats } from "@/lib/queries";
@@ -12,10 +14,12 @@ export function SettingsForm({
   initial,
   status,
   stats,
+  feedback,
 }: {
   initial: AppSettings;
   status: SystemStatus;
   stats: Stats;
+  feedback: ClipFeedback[];
 }) {
   const router = useRouter();
   const [s, setS] = useState<AppSettings>(initial);
@@ -23,6 +27,8 @@ export function SettingsForm({
   const [toast, setToast] = useState<string | null>(null);
   const [licensing, setLicensing] = useState(false);
   const [licence, setLicence] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+  const summary = summariseFeedback(feedback, s);
 
   const dirty = JSON.stringify(s) !== JSON.stringify(initial);
 
@@ -53,6 +59,33 @@ export function SettingsForm({
     }
   }
 
+  /** Save the feedback suggestion for every clip, without a second save step. */
+  async function applySuggestion() {
+    if (!summary.suggestion) return;
+    const next = { ...s, ...summary.suggestion.patch };
+    setS(next);
+    setApplying(true);
+    setToast(null);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      const data = (await res.json()) as { error?: string };
+      if (!res.ok) setToast(data.error ?? "Apply failed");
+      else {
+        setToast("Applied to every clip and new moments");
+        router.refresh();
+      }
+    } catch {
+      setToast("Network error");
+    } finally {
+      setApplying(false);
+      setTimeout(() => setToast(null), 3200);
+    }
+  }
+
   async function acceptLicence() {
     setLicensing(true);
     setLicence(null);
@@ -69,6 +102,104 @@ export function SettingsForm({
 
   return (
     <>
+      <section className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head">
+          <h2 className="panel-title">
+            <IconSparkle width={13} height={13} /> Suggestions for all clips
+          </h2>
+          <Badge tone={summary.total ? "neutral" : ""}>{summary.total} rated</Badge>
+        </div>
+        <div className="panel-body">
+          {summary.total === 0 ? (
+            <div className="setting-hint" style={{ maxWidth: 620 }}>
+              Nothing rated yet. Open the <a href="/clips" style={{ color: "var(--text)", textDecoration: "underline" }}>clip library</a>{" "}
+              and like or dislike a few clips — the suggestion for every clip shows up here.
+            </div>
+          ) : (
+            <div
+              style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}
+            >
+              <div style={{ flex: "1 1 240px" }}>
+                <div className="setting-label">
+                  {summary.liked} liked · {summary.disliked} disliked
+                </div>
+                {summary.reasons.length ? (
+                  <div className="row" style={{ gap: 5, flexWrap: "wrap", marginTop: 7 }}>
+                    {summary.reasons.slice(0, 5).map((reason) => (
+                      <Badge key={reason.slug}>
+                        {reason.label} ×{reason.count}
+                      </Badge>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+              <div
+                style={{
+                  flex: "2 1 360px",
+                  borderLeft: "1px solid var(--border)",
+                  paddingLeft: 16,
+                }}
+              >
+                {summary.suggestion ? (
+                  <>
+                    <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                      {summary.suggestion.headline}
+                    </div>
+                    <div className="setting-hint" style={{ maxWidth: "100%", marginTop: 3 }}>
+                      {summary.suggestion.detail}
+                    </div>
+                    <button
+                      className="btn sm primary"
+                      style={{ marginTop: 10 }}
+                      disabled={applying}
+                      onClick={applySuggestion}
+                    >
+                      {applying ? "Applying…" : "Apply to all clips"}
+                    </button>
+                  </>
+                ) : (
+                  <div className="setting-hint" style={{ maxWidth: "100%" }}>
+                    No change recommended yet: nothing you liked sits below the current
+                    floor, and your notes do not point at the cut. Keep rating clips and
+                    this updates.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-head">
+          <h2 className="panel-title">
+            <IconSparkle width={13} height={13} /> Direction for all clips
+          </h2>
+          <Badge tone={s.clipDirection.trim() ? "green" : ""}>
+            {s.clipDirection.trim() ? "active" : "empty"}
+          </Badge>
+        </div>
+        <div className="panel-body">
+          <div className="setting-hint" style={{ maxWidth: "100%", marginBottom: 8 }}>
+            Written into the analyser prompt for every new clip: what to pick, how titles
+            read, how captions sound. With Workers AI off, clips use the local heuristic and
+            this box has no effect.
+          </div>
+          <textarea
+            className="textarea"
+            rows={3}
+            maxLength={1200}
+            value={s.clipDirection}
+            onChange={(e) => set("clipDirection", e.target.value)}
+            placeholder="e.g. Pick insane gameplay and rage moments, not just loud chat. Titles under 45 characters and concrete. Captions sound like a friend, no chat references, no emoji spam."
+          />
+          <div className="faint" style={{ fontSize: 10.5, marginTop: 6 }}>
+            {s.clipDirection.length}/1200 · applied when you press Save changes, and to every
+            caption you regenerate after that
+          </div>
+        </div>
+      </section>
+
       <div className="grid grid-2" style={{ marginBottom: 16 }}>
         <section className="panel">
           <div className="panel-head">
@@ -180,6 +311,12 @@ export function SettingsForm({
                 <option value="clean">Clean</option>
                 <option value="karaoke">Karaoke</option>
               </select>
+            </Row>
+            <Row
+              label="Enlarge streamer webcam"
+              hint="When Workers AI spots a face cam in the frame, the clip stacks a large face band above the gameplay. No face cam found means the normal layout is used."
+            >
+              <Switch on={s.webcamFocus} onChange={(v) => set("webcamFocus", v)} />
             </Row>
             <Row label="Frame sampling rate" hint="Frames per second sent to the vision model. Lower is cheaper; 0.5 means one frame every two seconds.">
               <input

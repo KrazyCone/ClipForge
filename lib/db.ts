@@ -1,6 +1,7 @@
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import type { AppSettings } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
+import type { ClipFeedback } from "./feedback";
 
 export interface Env {
   DB: D1Database;
@@ -33,6 +34,73 @@ export async function files(): Promise<R2Bucket> {
   const e = await env();
   if (!e?.FILES) throw new Error("R2 binding FILES is not available in this environment.");
   return e.FILES;
+}
+
+let feedbackTable: Promise<void> | null = null;
+
+/**
+ * The feedback table ships in db/schema.sql, but an already-initialised D1
+ * database does not pick new DDL up on deploy. Creating it lazily keeps the
+ * likes/dislikes working without asking anyone to re-run /api/setup.
+ */
+export function ensureFeedbackTable(d: D1Database): Promise<void> {
+  if (!feedbackTable) {
+    feedbackTable = d
+      .batch([
+        d.prepare(
+          `CREATE TABLE IF NOT EXISTS clip_feedback (
+             clip_id      TEXT PRIMARY KEY,
+             sentiment    TEXT NOT NULL,
+             reasons_json TEXT,
+             note         TEXT,
+             quality_at   INTEGER,
+             created_at   TEXT NOT NULL,
+             updated_at   TEXT NOT NULL
+           )`,
+        ),
+        d.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_clip_feedback_sentiment ON clip_feedback(sentiment)",
+        ),
+      ])
+      .then(() => undefined)
+      .catch((err) => {
+        feedbackTable = null;
+        throw err;
+      });
+  }
+  return feedbackTable;
+}
+
+let webcamColumn: Promise<void> | null = null;
+
+/** The webcam crop column ships in db/schema.sql; a live database needs the ALTER. */
+export function ensureWebcamColumn(d: D1Database): Promise<void> {
+  if (!webcamColumn) {
+    webcamColumn = d
+      .prepare("ALTER TABLE clips ADD COLUMN webcam_json TEXT")
+      .run()
+      .then(() => undefined)
+      .catch(() => undefined);
+  }
+  return webcamColumn;
+}
+
+let analyzeColumn: Promise<void> | null = null;
+
+/**
+ * Single-clip rebuilds store their settings on the spike. The column ships in
+ * db/schema.sql, but a live database needs the ALTER; a duplicate-column error
+ * just means it is already there.
+ */
+export function ensureAnalyzeColumn(d: D1Database): Promise<void> {
+  if (!analyzeColumn) {
+    analyzeColumn = d
+      .prepare("ALTER TABLE spikes ADD COLUMN analyze_json TEXT")
+      .run()
+      .then(() => undefined)
+      .catch(() => undefined);
+  }
+  return analyzeColumn;
 }
 
 /** Read a single setting, falling back to the default when unset. */

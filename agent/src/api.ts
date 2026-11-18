@@ -10,6 +10,7 @@ export interface AgentSettings {
   frameSampleFps: number;
   aspectRatio: "9:16" | "1:1" | "16:9";
   subtitleStyle: "bold" | "clean" | "karaoke";
+  webcamFocus?: boolean;
   autoProcess: boolean;
   storageLimitMb: number;
 }
@@ -50,6 +51,8 @@ export interface QueueClip {
   game_name: string | null;
   stream_title: string | null;
   transcript: string | null;
+  /** detected webcam crop, `{ visible, region, size, box }` */
+  webcam_json?: string | null;
   status: string;
   created_at?: string;
 }
@@ -62,6 +65,7 @@ export interface AnalyzedClip {
   start_offset: number | null;
   end_offset: number | null;
   transcript: string | null;
+  webcam_json?: string | null;
 }
 
 export interface AnalyzeBeat {

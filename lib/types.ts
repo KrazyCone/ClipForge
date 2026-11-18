@@ -50,6 +50,8 @@ export interface Spike {
   merged_into: string | null;
   ai_json: string | null;
   ai_provider: string | null;
+  /** per-spike settings for a one-off rebuild; cleared once consumed */
+  analyze_json: string | null;
   created_at: string;
 }
 
@@ -83,6 +85,10 @@ export interface Clip {
   start_offset: number | null;
   end_offset: number | null;
   transcript: string | null;
+  /** detected webcam crop, `{ visible, region, size, box }` */
+  webcam_json: string | null;
+  /** derived: the source moment is queued for a one-off re-cut */
+  rebuild_pending?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -97,6 +103,10 @@ export interface AppSettings {
   frameSampleFps: number;
   aspectRatio: "9:16" | "1:1" | "16:9";
   subtitleStyle: "bold" | "clean" | "karaoke";
+  /** standing free-text direction applied to every clip's pick, title and caption */
+  clipDirection: string;
+  /** stack an enlarged webcam band above the gameplay when a face cam is found */
+  webcamFocus: boolean;
   autoProcess: boolean;
   discoveryEnabled: boolean;
   storageLimitMb: number;
@@ -112,6 +122,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   frameSampleFps: 0.5,
   aspectRatio: "9:16",
   subtitleStyle: "bold",
+  clipDirection: "",
+  webcamFocus: true,
   autoProcess: true,
   discoveryEnabled: true,
   storageLimitMb: 900,

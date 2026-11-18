@@ -1,15 +1,16 @@
 import { getSettings } from "@/lib/db";
-import { getStats } from "@/lib/queries";
+import { getAllFeedback, getStats } from "@/lib/queries";
 import { getSystemStatus } from "@/lib/status";
 import { SettingsForm } from "@/components/SettingsForm";
 
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
-  const [settings, status, stats] = await Promise.all([
+  const [settings, status, stats, feedback] = await Promise.all([
     getSettings(),
     getSystemStatus(),
     getStats(),
+    getAllFeedback(),
   ]);
 
   return (
@@ -24,7 +25,7 @@ export default async function SettingsPage() {
         </div>
       </div>
 
-      <SettingsForm initial={settings} status={status} stats={stats} />
+      <SettingsForm initial={settings} status={status} stats={stats} feedback={feedback} />
     </>
   );
 }

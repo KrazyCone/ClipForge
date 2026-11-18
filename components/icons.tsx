@@ -63,6 +63,12 @@ export const IconCpu = (p: SVGProps<SVGSVGElement>) => (
 export const IconDatabase = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}><ellipse cx="12" cy="6" rx="8" ry="3" /><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" /></svg>
 );
+export const IconThumbUp = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}><path d="M7 21V10l4-7 1 1.5V9h5.5a2 2 0 0 1 2 2.4l-1.3 7a2 2 0 0 1-2 1.6H7zM7 10H3v11h4" /></svg>
+);
+export const IconThumbDown = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}><g transform="rotate(180 12 12)"><path d="M7 21V10l4-7 1 1.5V9h5.5a2 2 0 0 1 2 2.4l-1.3 7a2 2 0 0 1-2 1.6H7zM7 10H3v11h4" /></g></svg>
+);
 export const IconExternal = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}><path d="M14 4h6v6M20 4l-8.5 8.5M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>
 );

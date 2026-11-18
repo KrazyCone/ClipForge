@@ -6,13 +6,17 @@ import { rm, writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { audioLoudness, renderClip, thumbnail, extractAudio, sampleFrames } from "./ffmpeg.js";
 import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
+import { parseWebcamBox } from "./webcam.js";
 import type { AgentSettings, AnalyzeBeat, AnalyzeResult, QueueClip, TimedCaption } from "./api.js";
 import type { ClipforgeApi } from "./api.js";
 import { log } from "./config.js";
 
 export interface ProduceOptions {
   api: ClipforgeApi;
-  clip: Pick<QueueClip, "id" | "caption" | "title" | "start_offset" | "end_offset" | "source_ts">;
+  clip: Pick<
+    QueueClip,
+    "id" | "caption" | "title" | "start_offset" | "end_offset" | "source_ts" | "webcam_json"
+  >;
   /** local file containing the footage */
   sourceFile: string;
   /** wall-clock unix seconds of the source file's first frame */
@@ -81,6 +85,8 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
     assPath,
     aspect: settings.aspectRatio,
     cropMode: "blur",
+    webcam: parseWebcamBox(clip.webcam_json),
+    focusWebcam: settings.webcamFocus === true,
   });
 
   const thumbPath = path.join(workDir, "live.jpg");

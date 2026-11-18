@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS spikes (
   merged_into     TEXT,
   ai_json         TEXT,
   ai_provider     TEXT,
+  analyze_json    TEXT,                 -- one-off rebuild settings, cleared after use
   created_at      TEXT NOT NULL
 );
 
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS clips (
   start_offset  REAL,
   end_offset    REAL,
   transcript    TEXT,
+  webcam_json   TEXT,                   -- detected face-cam crop for the layout
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );
@@ -105,6 +107,20 @@ CREATE TABLE IF NOT EXISTS clips (
 CREATE INDEX IF NOT EXISTS idx_clips_created ON clips(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clips_quality ON clips(quality_score DESC);
 CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status);
+
+-- One row per clip: the owner's reaction. Used to tune the quality floor and
+-- the cut window, and to filter the library by what you actually liked.
+CREATE TABLE IF NOT EXISTS clip_feedback (
+  clip_id      TEXT PRIMARY KEY,
+  sentiment    TEXT NOT NULL,          -- like | mixed | dislike
+  reasons_json TEXT,                   -- JSON array of reason slugs
+  note         TEXT,
+  quality_at   INTEGER,                -- quality score when the reaction was saved
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_clip_feedback_sentiment ON clip_feedback(sentiment);
 
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,

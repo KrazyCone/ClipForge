@@ -1,5 +1,6 @@
-import { db, usageTotals } from "./db";
+import { db, ensureAnalyzeColumn, ensureFeedbackTable, usageTotals } from "./db";
 import type { Channel, Clip, Spike } from "./types";
+import type { ClipFeedback } from "./feedback";
 
 export async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
   try {
@@ -32,8 +33,15 @@ export async function getAllChannels(): Promise<Channel[]> {
 export async function getRecentClips(limit = 12): Promise<Clip[]> {
   return safe(async () => {
     const d = await db();
+    await ensureAnalyzeColumn(d);
     const { results } = await d
-      .prepare("SELECT * FROM clips ORDER BY created_at DESC LIMIT ?")
+      .prepare(
+        `SELECT c.*,
+           (s.analyze_json IS NOT NULL AND s.status IN ('queued','analyzing','rendering'))
+             AS rebuild_pending
+         FROM clips c LEFT JOIN spikes s ON s.id = c.spike_id
+         ORDER BY c.created_at DESC LIMIT ?`,
+      )
       .bind(limit)
       .all<Clip>();
     return results ?? [];
@@ -47,6 +55,17 @@ export async function getTopClips(limit = 6): Promise<Clip[]> {
       .prepare("SELECT * FROM clips WHERE status = 'ready' ORDER BY quality_score DESC, created_at DESC LIMIT ?")
       .bind(limit)
       .all<Clip>();
+    return results ?? [];
+  }, []);
+}
+
+export async function getAllFeedback(): Promise<ClipFeedback[]> {
+  return safe(async () => {
+    const d = await db();
+    await ensureFeedbackTable(d);
+    const { results } = await d
+      .prepare("SELECT * FROM clip_feedback ORDER BY updated_at DESC")
+      .all<ClipFeedback>();
     return results ?? [];
   }, []);
 }

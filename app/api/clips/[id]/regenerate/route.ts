@@ -1,4 +1,4 @@
-import { db, env } from "@/lib/db";
+import { db, env, getSettings } from "@/lib/db";
 import { regenerateCaption } from "@/lib/ai";
 import type { MomentInput } from "@/lib/ai";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -54,7 +54,13 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
     };
 
     const e = await env();
-    const { caption, provider } = await regenerateCaption(e, input, clip.caption ?? "");
+    const settings = await getSettings();
+    const { caption, provider } = await regenerateCaption(
+      e,
+      input,
+      clip.caption ?? "",
+      settings.clipDirection,
+    );
 
     await d
       .prepare("UPDATE clips SET caption = ?, updated_at = ? WHERE id = ?")
