@@ -9,6 +9,7 @@ import {
 } from "@/lib/ai";
 import { boxFromHint, storedWebcam } from "@/lib/webcam";
 import { pollSignals } from "@/lib/poll";
+import { uniqueTitle } from "@/lib/titles";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -53,7 +54,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     // A single-clip rebuild stores the settings it should use on the spike, so
     // the re-cut honours the suggestion without changing the saved defaults.
-    let override: { clipDurationSec?: number; minQualityScore?: number } = {};
+    let override: {
+      clipDurationSec?: number;
+      minQualityScore?: number;
+      longer?: boolean;
+      needsContext?: boolean;
+    } = {};
     try {
       override = JSON.parse(spike.analyze_json ?? "{}") as typeof override;
     } catch {
@@ -67,11 +73,32 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const effectiveFloor = Number.isFinite(overrideFloor)
       ? Math.max(0, Math.min(95, overrideFloor))
       : settings.minQualityScore;
+    // A per-clip re-cut can ask for a longer cut and for the setup around the
+    // moment, not just a bigger duration ceiling.
+    const longer = override.longer === true;
+    const needsContext = override.needsContext === true;
+    const extraSec = needsContext ? 12 : longer ? 8 : 0;
 
     const channel = await d
       .prepare("SELECT * FROM channels WHERE id = ?")
       .bind(spike.channel_id)
       .first<Channel>();
+
+    // A rebuild keeps the clip row, so its own title must not count as taken.
+    const existing = await d
+      .prepare("SELECT id FROM clips WHERE spike_id = ?")
+      .bind(id)
+      .first<{ id: string }>();
+    const titleRows =
+      (
+        await d
+          .prepare("SELECT id, title FROM clips ORDER BY created_at DESC LIMIT 400")
+          .all<{ id: string; title: string | null }>()
+      ).results ?? [];
+    const takenTitles = titleRows
+      .filter((row) => row.id !== existing?.id)
+      .map((row) => row.title ?? "")
+      .filter(Boolean);
 
     const body = (await readJson<AnalyzeBody>(req)) ?? {};
 
@@ -152,7 +179,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .slice(0, 200)
       .map((v) => Number(v))
       .filter((v) => Number.isFinite(v));
-    const maxClipSec = Math.max(8, Math.min(60, effectiveDuration));
+    const maxClipSec = Math.max(8, Math.min(60, effectiveDuration + extraSec));
 
     const input: MomentInput = {
       channelName: channel?.display_name ?? spike.channel_login,
@@ -170,6 +197,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       maxClipSec,
       direction: settings.clipDirection,
       pollHint: poll.likely ? poll.reason : undefined,
+      contextHint: needsContext,
+      avoidTitles: takenTitles.slice(0, 40),
     };
 
     const analysis = await analyzeMoment(e, input);
@@ -262,9 +291,35 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         },
       ];
     }
+    // Widening the cuts is what makes a re-cut longer or fuller-context; a
+    // larger duration ceiling on its own would not add a single frame.
+    if (longer || needsContext) {
+      const pad = needsContext ? 3 : 2;
+      beats = beats
+        .map((beat) => ({
+          ...beat,
+          startSec: Math.max(windowStartSec, beat.startSec - pad),
+          endSec: Math.min(windowEndSec, beat.endSec + pad),
+        }))
+        .reduce<MomentBeat[]>((out, beat) => {
+          const previous = out[out.length - 1];
+          if (previous && beat.startSec <= previous.endSec + 0.4) {
+            previous.endSec = Math.max(previous.endSec, beat.endSec);
+          } else {
+            out.push({ ...beat });
+          }
+          return out;
+        }, []);
+    }
     if (beats.length === 1 && beats[0].endSec - beats[0].startSec < 6) {
       beats[0] = { ...beats[0], endSec: Math.min(windowEndSec, beats[0].startSec + 6) };
     }
+
+    // The model is told to avoid these, but the store is the guarantee.
+    analysis.title = uniqueTitle(analysis.title, takenTitles, [
+      `${analysis.title} — ${channel?.game_name ?? analysis.category}`,
+      `${analysis.title} — ${analysis.category}`,
+    ]);
 
     const assembledSec = beats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0);
     analysis.beginsAtSec = beats[0].startSec;
@@ -337,10 +392,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // Reuse the clip job for this spike rather than creating duplicates. On a
     // rebuild this replaces the stored metadata and hands the clip back to the
     // renderer with the freshly picked beats.
-    const existing = await d
-      .prepare("SELECT id FROM clips WHERE spike_id = ?")
-      .bind(id)
-      .first<{ id: string }>();
     if (existing) {
       await d
         .prepare(

@@ -1,6 +1,7 @@
 import { db, ensureAnalyzeColumn, ensureFeedbackTable, usageTotals } from "./db";
 import type { Channel, Clip, Spike } from "./types";
 import type { ClipFeedback } from "./feedback";
+import { uniqueTitleChanges } from "./titles";
 
 export async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
   try {
@@ -30,10 +31,30 @@ export async function getAllChannels(): Promise<Channel[]> {
   }, []);
 }
 
+/**
+ * Repairs clips that ended up with the same title. The first (oldest) keeps it
+ * and every later duplicate is renamed, so this is a one-time change that turns
+ * into a cheap no-op once the table is unique.
+ */
+export async function ensureUniqueClipTitles(): Promise<void> {
+  try {
+    const d = await db();
+    const { results } = await d
+      .prepare("SELECT id, title FROM clips ORDER BY created_at ASC, id ASC")
+      .all<{ id: string; title: string | null }>();
+    for (const change of uniqueTitleChanges(results ?? [])) {
+      await d.prepare("UPDATE clips SET title = ? WHERE id = ?").bind(change.title, change.id).run();
+    }
+  } catch {
+    /* a cosmetic repair must never break the library */
+  }
+}
+
 export async function getRecentClips(limit = 12): Promise<Clip[]> {
   return safe(async () => {
     const d = await db();
     await ensureAnalyzeColumn(d);
+    await ensureUniqueClipTitles();
     const { results } = await d
       .prepare(
         `SELECT c.*,

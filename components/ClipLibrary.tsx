@@ -7,6 +7,7 @@ import {
   IconDownload,
   IconFilm,
   IconPlay,
+  IconPlus,
   IconRefresh,
   IconSparkle,
   IconThumbDown,
@@ -183,9 +184,16 @@ export function ClipLibrary({
     setBusy(null);
   }
 
-  async function rebuild(clip: Clip) {
+  async function rebuild(
+    clip: Clip,
+    options: { makeLonger?: boolean; needsContext?: boolean } = {},
+  ) {
     setBusy(clip.id);
-    const res = await fetch(`/api/clips/${clip.id}/rebuild`, { method: "POST" });
+    const res = await fetch(`/api/clips/${clip.id}/rebuild`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(options),
+    });
     const data = (await res.json()) as { ok?: boolean; queued?: boolean; error?: string };
     if (res.ok) {
       // The clip stays playable, but the card shows the re-cut is waiting.
@@ -195,7 +203,13 @@ export function ClipLibrary({
       setOpen((prev) =>
         prev && prev.id === clip.id ? { ...prev, rebuild_pending: 1 } : prev,
       );
-      setToast("Queued — the collector re-cuts this clip on its next pass");
+      setToast(
+        options.makeLonger
+          ? "Queued — a longer re-cut is on its way"
+          : options.needsContext
+            ? "Queued — the re-cut will include the setup"
+            : "Queued — the collector re-cuts this clip on its next pass",
+      );
       await load(sort === "taste" ? "newest" : sort);
     } else {
       setToast(data.error ?? "Could not queue the rebuild");
@@ -486,7 +500,7 @@ export function ClipLibrary({
           onSave={(title, caption) => saveEdit(open, title, caption)}
           suggestion={summary.suggestion}
           webcamFocus={current.webcamFocus}
-          onRebuild={() => rebuild(open)}
+          onRebuild={(options) => rebuild(open, options)}
           onApplySuggestion={applySuggestion}
           onFeedback={(next) =>
             setFeedback((prev) => {
@@ -529,13 +543,14 @@ function ClipModal({
   onRegenerate: () => void;
   onReprocess: () => void;
   onSave: (title: string, caption: string) => void;
-  onRebuild: () => void;
+  onRebuild: (options?: { makeLonger?: boolean; needsContext?: boolean }) => void;
   onApplySuggestion: (patch: Partial<AppSettings>) => void;
   onFeedback: (feedback: ClipFeedback | null) => void;
 }) {
   const [title, setTitle] = useState(clip.title ?? "");
   const [caption, setCaption] = useState(clip.caption ?? "");
   const [copied, setCopied] = useState(false);
+  const [needsContext, setNeedsContext] = useState(false);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -583,11 +598,28 @@ function ClipModal({
             <button
               className="btn sm primary"
               disabled={busy || Boolean(clip.rebuild_pending)}
-              onClick={onRebuild}
+              onClick={() => onRebuild({ needsContext })}
             >
               <IconRefresh width={12} height={12} />{" "}
               {clip.rebuild_pending ? "Re-cut queued" : "Reprocess this clip"}
             </button>
+            <button
+              className="btn sm"
+              disabled={busy || Boolean(clip.rebuild_pending)}
+              title="Re-cut with more footage around the moment"
+              onClick={() => onRebuild({ makeLonger: true, needsContext })}
+            >
+              <IconPlus width={12} height={12} /> Make longer
+            </button>
+            <label className="check-inline" title="Include the lead-up and full exchange, not just the payoff">
+              <input
+                type="checkbox"
+                checked={needsContext}
+                disabled={busy || Boolean(clip.rebuild_pending)}
+                onChange={(event) => setNeedsContext(event.target.checked)}
+              />
+              Needs extra context
+            </label>
             <button
               className="btn sm"
               disabled={!suggestion || busy}

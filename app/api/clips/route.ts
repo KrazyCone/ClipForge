@@ -2,6 +2,7 @@ import { db, ensureAnalyzeColumn } from "@/lib/db";
 import { json } from "@/lib/api";
 import type { Clip } from "@/lib/types";
 import { denied } from "@/lib/guard";
+import { ensureUniqueClipTitles } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -43,6 +44,8 @@ export async function GET(req: Request) {
   try {
     const d = await db();
     await ensureAnalyzeColumn(d);
+    // Older clips could share a generated title; name the later ones once.
+    await ensureUniqueClipTitles();
     // rebuild_pending is derived from the source moment's one-off settings, so
     // the card can show a re-cut is waiting without hiding the current video.
     const sql = `SELECT c.*,

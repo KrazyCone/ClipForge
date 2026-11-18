@@ -42,6 +42,10 @@ export interface MomentInput {
   direction?: string;
   /** chat looks like a poll or command vote, not a reaction */
   pollHint?: string;
+  /** the operator asked for the setup around the moment, not only the payoff */
+  contextHint?: boolean;
+  /** titles already used by other clips; the new one must differ */
+  avoidTitles?: string[];
   /** prior assessment summary, used when regenerating copy */
   summary?: string;
 }
@@ -571,6 +575,7 @@ Rules:
 - beginsAtSec and endsAtSec are OFFSETS IN SECONDS FROM THE SPIKE PEAK, not timestamps. 0 is the peak, negative is footage before it. They are advisory: the cuts come from funnySegmentIndices.
 - title and caption describe what HAPPENED IN THE VIDEO: the play, the reaction, the outcome. Never mention chat, viewers, donations or "chat going wild" - the chat is only how the moment was found, it is not the story.
 - Prefer concrete wording (the play, the game, the outcome) over generic hype.
+- The title must be specific to this moment and different from every recent title supplied. Never reuse or lightly reword one.
 - Repeating short answers (1, 2, A, B, yes, no, !vote) means chat is voting in a poll or running a command, not reacting. A poll is not a moment by itself: only pick a segment if something genuinely funny or impressive happens on stream during it. If nothing does, return [] and keep the funniness low.`;
 
 function safeParse(text: string): Partial<MomentAnalysis> | null {
@@ -603,6 +608,12 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
     `Chat features: ${JSON.stringify(input.features)}`,
     `Chat sample:\n${input.messages.slice(0, 18).join("\n")}`,
     input.pollHint ? `Chat pattern: ${input.pollHint} - this is a vote, not a reaction.` : "",
+    input.contextHint
+      ? "Operator note: this moment needs extra context. Start the first cut earlier and keep the setup lines that lead into the payoff; do not add unrelated filler."
+      : "",
+    input.avoidTitles?.length
+      ? `Recent titles (do not reuse or reword any of these):\n${input.avoidTitles.slice(0, 40).join("\n")}`
+      : "",
     timedTranscript
       ? `Transcript segments (times relative to the spike peak):\n${timedTranscript.slice(0, 2400)}`
       : input.transcript

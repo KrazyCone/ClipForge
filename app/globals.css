@@ -488,6 +488,24 @@ input[type="range"]::-webkit-slider-thumb {
   gap: 7px;
 }
 .modal-suggest .setting-hint { max-width: 100%; }
+
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.check-inline input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent, #cfcfcf);
+  cursor: pointer;
+}
 .modal-info { padding: 20px; display: flex; flex-direction: column; gap: 14px; }
 .modal-close { position: absolute; top: 14px; right: 16px; z-index: 3; }
 
