@@ -6,11 +6,12 @@
 #      so a detected spike can be cut and rendered immediately - while the
 #      stream is still live - instead of waiting for the archive VOD.
 #
-# Coverage model: a run holds IRC connections for 5h45m and cron starts a new
-# run every 6 hours, so there is roughly a 15 minute gap per rotation plus
-# GitHub's cron delay. Jobs on a PUBLIC repository are free and unmetered; on a
-# private repository the 2,000 free minutes/month cap applies - shorten
-# RUN_SECONDS and the cron interval if this repo is private.
+# Coverage model: a run holds IRC connections for two hours, then queues its
+# own successor, so rotation is continuous instead of depending on GitHub's
+# cron (which has never fired for this repository). A run also ends early when
+# nothing has been live for fifteen minutes. Jobs on a PUBLIC repository are
+# free and unmetered; on a private repository the monthly free minutes cap
+# applies - lengthen the window only if you are paying for it.
 
 name: ClipForge collector
 
@@ -32,7 +33,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 140
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +62,7 @@ jobs:
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
           TWITCH_BOT_LOGIN: ${{ secrets.TWITCH_BOT_LOGIN }}
           TWITCH_BOT_TOKEN: ${{ secrets.TWITCH_BOT_TOKEN }}
-          RUN_SECONDS: "20700"
+          RUN_SECONDS: "7200"
           MAX_CHANNELS: "5"
         run: node dist/agent/src/collector.js
 
@@ -75,6 +76,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ github.ref_name }}
         run: |
+          # The collector sets NEXT_RUN_DELAY when it stopped because nothing was
+          # live; waiting here keeps the polling rhythm without a boot every minute.
+          delay="${NEXT_RUN_DELAY:-0}"
+          if [ "$delay" != "0" ]; then
+            echo "nothing was live - waiting ${delay}s before the next run"
+            sleep "$delay"
+          fi
           gh workflow run collect.yml --ref "$BRANCH" \
             && echo "queued the next collector run on $BRANCH" \
             || echo "could not queue the next run - dispatch it by hand"

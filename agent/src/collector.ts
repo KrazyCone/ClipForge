@@ -11,7 +11,7 @@
  * TWITCH_BOT_LOGIN / TWITCH_BOT_TOKEN to connect as a real account instead.
  */
 import WebSocket from "ws";
-import { mkdtemp } from "node:fs/promises";
+import { appendFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { loadConfig, log } from "./config.js";
@@ -25,6 +25,13 @@ import { analyseLocal, cleanupWorkDir, produceClipFromFile } from "./produce.js"
 import { describeDrain, drainQueue } from "./render.js";
 
 const IRC_URL = "wss://irc-ws.chat.twitch.tv:443";
+/** End the run once nothing has been live for this long, instead of idling for hours. */
+const IDLE_EXIT_MS = 15 * 60_000;
+/** Reconnect if a live channel's chat has been silent for this long: the socket is usually dead. */
+const SILENT_SOCKET_MS = 10 * 60_000;
+const HEARTBEAT_MS = 5 * 60_000;
+/** How long a run with nothing to watch waits before the next one starts. */
+const IDLE_HANDOVER_SEC = 300;
 
 interface ChannelState {
   id: string;
@@ -94,6 +101,13 @@ export class Collector {
   private draining = false;
   /** Spikes that arrived while both live render slots were busy. */
   private pendingLive: { login: string; ts: number; spikeId: string }[] = [];
+  private watchTimer: NodeJS.Timeout | null = null;
+  private windowTimer: NodeJS.Timeout | null = null;
+  private lastMessageAt = Date.now();
+  private lastLiveAt = Date.now();
+  private lastBeatAt = Date.now();
+  private messagesSinceBeat = 0;
+  private capLogged = false;
 
   constructor(
     private api: ClipforgeApi,
@@ -127,6 +141,7 @@ export class Collector {
 
     log(`collecting ${this.states.size} channel(s): ${[...this.states.keys()].join(", ")}`);
     await this.connect();
+    this.startWatchdog();
 
     this.flushTimer = setInterval(() => void this.flushCompletedMinutes(), 15000);
     this.detectTimer = setInterval(() => void this.detectAll(), 5000);
@@ -138,7 +153,10 @@ export class Collector {
     );
 
     // Self-terminate so the scheduled job can restart cleanly (Actions default).
-    setTimeout(() => void this.stop("run window elapsed"), this.cfg.runSeconds * 1000);
+    // Stored and unref'd: if the watchdog ends the run early, a leftover timer
+    // must not keep the process (and the job) alive for the rest of the window.
+    this.windowTimer = setTimeout(() => void this.stop("run window elapsed"), this.cfg.runSeconds * 1000);
+    this.windowTimer.unref();
 
     await new Promise<void>((resolve) => {
       this.onStop = resolve;
@@ -155,6 +173,8 @@ export class Collector {
     if (this.detectTimer) clearInterval(this.detectTimer);
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     if (this.drainTimer) clearInterval(this.drainTimer);
+    if (this.watchTimer) clearInterval(this.watchTimer);
+    if (this.windowTimer) clearTimeout(this.windowTimer);
     for (const recorder of this.recorders.values()) await recorder.stop();
     this.recorders.clear();
     await this.flushAll().catch((err) => log("final flush failed", String(err)));
@@ -244,6 +264,9 @@ export class Collector {
 
       const state = this.states.get(channel);
       if (!state) continue;
+
+      this.lastMessageAt = Date.now();
+      this.messagesSinceBeat++;
 
       const user = tags["display-name"] || tags.login || rest.slice(1, rest.indexOf("!"));
       const emotes = parseEmotes(tags.emotes);
@@ -401,11 +424,64 @@ export class Collector {
     this.reconcileTimer = setInterval(() => void this.reconcileBuffers(), 300_000);
   }
 
+  /**
+   * Keeps a long run honest: it reports that chat is still arriving, reconnects
+   * an IRC socket that has gone silent, and ends the run when nothing is live
+   * instead of sitting on a runner for the rest of the window.
+   */
+  private startWatchdog(): void {
+    this.watchTimer = setInterval(() => void this.watchdogTick(), 60_000);
+  }
+
+  private async watchdogTick(): Promise<void> {
+    if (this.stopping) return;
+    const now = Date.now();
+
+    if (now - this.lastLiveAt > IDLE_EXIT_MS) {
+      const idleMin = Math.round((now - this.lastLiveAt) / 60_000);
+      log(`no monitored channel has been live for ${idleMin} min - ending this run and handing over`);
+      await this.handOver(IDLE_HANDOVER_SEC);
+      await this.stop("no live channels");
+      return;
+    }
+
+    const silentFor = now - this.lastMessageAt;
+    if (silentFor > SILENT_SOCKET_MS) {
+      // A live channel that sends nothing for ten minutes is almost always a
+      // socket Twitch stopped delivering on rather than a quiet chat.
+      log(`no chat for ${Math.round(silentFor / 1000)}s while a channel is live - reconnecting irc`);
+      this.lastMessageAt = now;
+      try {
+        this.ws?.close();
+      } catch {
+        /* already closed */
+      }
+      return;
+    }
+
+    if (now - this.lastBeatAt >= HEARTBEAT_MS) {
+      log(
+        `heartbeat: ${this.states.size} channel(s) joined, ${this.recorders.size} buffering, ` +
+          `${this.messagesSinceBeat} chat message(s) in the last ${Math.round((now - this.lastBeatAt) / 60_000)} min`,
+      );
+      this.lastBeatAt = now;
+      this.messagesSinceBeat = 0;
+    }
+  }
+
+  /** Tells the workflow how long to wait before it queues the next run. */
+  private async handOver(delaySeconds: number): Promise<void> {
+    const file = process.env.GITHUB_ENV;
+    if (!file) return;
+    await appendFile(file, `NEXT_RUN_DELAY=${delaySeconds}\n`).catch(() => {});
+  }
+
   private startDrainLoop(): void {
     if (!this.vod.configured) return;
     // Not immediately: the first bursts of a run are the live path's job, and
     // an archive VOD does not exist until a stream has ended anyway.
-    setTimeout(() => void this.drainQueuedWork(), 120_000);
+    const firstDrain = setTimeout(() => void this.drainQueuedWork(), 120_000);
+    firstDrain.unref();
     this.drainTimer = setInterval(() => void this.drainQueuedWork(), 180_000);
   }
 
@@ -465,9 +541,11 @@ export class Collector {
         }
         this.addChannel(channel);
       }
-      if (capped) {
-        log(`channel cap ${cap} reached - not joining further live channels this run`);
+      if (capped && !this.capLogged) {
+        this.capLogged = true;
+        log(`channel cap ${cap} reached - ignoring any further live channels this run`);
       }
+      if (live.channels.some((c) => c.is_live === 1)) this.lastLiveAt = Date.now();
 
       // A channel paused (monitor = 0) or removed mid-run must stop counting.
       for (const login of [...this.states.keys()]) {
@@ -510,6 +588,9 @@ export class Collector {
         }
       }
     } catch (err) {
+      // A failed refresh is not evidence that nothing is live, so it must not
+      // count towards the idle exit.
+      this.lastLiveAt = Date.now();
       log(`live reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       this.reconciling = false;
