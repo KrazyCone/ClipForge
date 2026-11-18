@@ -13,6 +13,11 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+# Needed only so a finished run can queue the next one.
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: clipforge-renderer
   cancel-in-progress: false
@@ -37,6 +42,7 @@ jobs:
         run: cd agent && npm install --no-audit --no-fund
 
       - name: Build agent
+        id: build
         run: cd agent && npm run build
 
       - name: Render queued clips
@@ -47,3 +53,19 @@ jobs:
           TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
         run: node dist/agent/src/renderer.js
+
+      # The schedule trigger never fires here either, so each run waits out the
+      # ten minute interval and queues the next one.
+      - name: Wait out the render interval
+        if: always() && steps.build.outcome == 'success'
+        run: sleep 540
+
+      - name: Queue the next render run
+        if: always() && steps.build.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          gh workflow run render.yml --ref "$BRANCH" \
+            && echo "queued the next render run on $BRANCH" \
+            || echo "could not queue the next run - dispatch it by hand"

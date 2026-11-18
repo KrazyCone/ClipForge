@@ -19,6 +19,12 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
+# Needed only so a finished run can queue the next one; nothing is written to
+# the repository itself.
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: clipforge-collector
   cancel-in-progress: false
@@ -43,6 +49,7 @@ jobs:
         run: cd agent && npm install --no-audit --no-fund
 
       - name: Build agent
+        id: build
         run: cd agent && npm run build
 
       - name: Collect chat and cut live clips
@@ -57,3 +64,17 @@ jobs:
           RUN_SECONDS: "20700"
           MAX_CHANNELS: "5"
         run: node dist/agent/src/collector.js
+
+      # GitHub's schedule trigger has never actually fired for this repository,
+      # so the collector keeps itself running: every build that compiles queues
+      # the next run, and the concurrency group above starts it the moment this
+      # job ends. Disable the workflow to stop the chain.
+      - name: Queue the next collector run
+        if: always() && steps.build.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          gh workflow run collect.yml --ref "$BRANCH" \
+            && echo "queued the next collector run on $BRANCH" \
+            || echo "could not queue the next run - dispatch it by hand"
