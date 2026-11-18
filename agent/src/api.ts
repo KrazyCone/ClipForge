@@ -35,6 +35,8 @@ export interface QueueSpike {
 export interface QueueClip {
   id: string;
   spike_id: string | null;
+  /** the spike's stored analysis, which carries the beat plan for old clips */
+  spike_ai_json?: string | null;
   channel_id: string | null;
   channel_login: string | null;
   channel_name: string | null;
@@ -56,9 +58,33 @@ export interface AnalyzedClip {
   id: string;
   caption: string | null;
   title: string | null;
+  source_ts: number | null;
   start_offset: number | null;
   end_offset: number | null;
   transcript: string | null;
+}
+
+export interface AnalyzeBeat {
+  startSec: number;
+  endSec: number;
+  score: number;
+}
+
+export interface TimedCaption {
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+export interface AnalyzePayload {
+  frames?: string[];
+  audioBase64?: string;
+  transcript?: string;
+  /** start of the sampled footage, relative to the spike peak */
+  windowStartSec?: number;
+  /** dBFS per bucket across the sampled footage */
+  loudness?: number[];
+  loudnessBucketSec?: number;
 }
 
 export interface AnalyzeResult {
@@ -67,6 +93,9 @@ export interface AnalyzeResult {
   skipped?: boolean;
   reason?: string;
   transcript?: string;
+  sttError?: string | null;
+  beats?: AnalyzeBeat[];
+  captions?: TimedCaption[];
   clip?: AnalyzedClip;
   analysis?: {
     qualityScore: number;
@@ -189,10 +218,7 @@ export class ClipforgeApi {
     ).catch(() => {});
   }
 
-  async analyze(
-    id: string,
-    payload: { frames?: string[]; audioBase64?: string; transcript?: string },
-  ): Promise<AnalyzeResult> {
+  async analyze(id: string, payload: AnalyzePayload): Promise<AnalyzeResult> {
     // Frames + Whisper + the LLM can take a while, but a hung analysis must not
     // hold a live render slot for the rest of the run.
     const res = await this.request(

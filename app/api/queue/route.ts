@@ -33,7 +33,10 @@ export async function GET(req: Request) {
       // live path abandoned or never attempted.
       d
         .prepare(
-          "SELECT * FROM clips WHERE status = 'pending' AND created_at < ? ORDER BY created_at ASC LIMIT ?",
+          `SELECT c.*, s.ai_json AS spike_ai_json
+           FROM clips c LEFT JOIN spikes s ON s.id = c.spike_id
+           WHERE c.status = 'pending' AND c.created_at < ?
+           ORDER BY c.created_at ASC LIMIT ?`,
         )
         .bind(new Date(Date.now() - 3 * 60 * 1000).toISOString(), limit)
         .all<Clip>(),

@@ -26,8 +26,37 @@ export interface MomentInput {
   visualNotes?: string[];
   /** speech transcript around the moment, when STT ran */
   transcript?: string;
+  /** start of the analysed footage, in seconds relative to the spike peak */
+  windowStartSec?: number;
+  /** loudness in dBFS per bucket, relative to the start of the analysed window */
+  loudness?: number[];
+  loudnessBucketSec?: number;
+  /** Whisper segments, relative to the start of the analysed window */
+  transcriptSegments?: SpokenSegment[];
+  /** ceiling for the assembled multi-cut clip */
+  maxClipSec?: number;
   /** prior assessment summary, used when regenerating copy */
   summary?: string;
+}
+
+export interface SpokenSegment {
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+/** One cut of the moment, relative to the spike peak. */
+export interface MomentBeat {
+  startSec: number;
+  endSec: number;
+  score: number;
+}
+
+/** A subtitle card already placed on the assembled clip's timeline. */
+export interface TimedCaption {
+  startSec: number;
+  endSec: number;
+  text: string;
 }
 
 export interface MomentAnalysis {
@@ -39,6 +68,12 @@ export interface MomentAnalysis {
   funniness: number;
   beginsAtSec: number;
   endsAtSec: number;
+  /** cuts chosen for the assembled clip, relative to the spike peak */
+  beats: MomentBeat[];
+  /** centre of the loudest reaction, or the spike when audio has no clear peak */
+  anchorSec: number;
+  /** transcript segments the model judged funniest, best first */
+  funnySegmentIndices: number[];
   title: string;
   caption: string;
   hashtags: string[];
@@ -77,20 +112,36 @@ async function runModel(e: Env, model: string, body: unknown): Promise<unknown> 
 /** Speech-to-text via Workers AI Whisper. Returns "" when unavailable. */
 export async function transcribe(
   e: Env,
-  audio: ArrayBuffer,
-): Promise<{ text: string; provider: string; error?: string } | null> {
+  audioBase64: string,
+): Promise<{ text: string; segments: SpokenSegment[]; provider: string; error?: string } | null> {
   if (!aiConfigured(e)) return null;
   const model = e.STT_MODEL || "@cf/openai/whisper-large-v3-turbo";
   try {
-    const binary = [...new Uint8Array(audio)];
-    const json = (await runModel(e, model, { audio: binary })) as {
-      result?: { text?: string };
+    // The REST endpoint's input schema takes base64 audio. Sending a JSON array
+    // of raw bytes instead made every transcription fail, which is why clips
+    // only ever got the caption card: there was never a transcript to burn.
+    const json = (await runModel(e, model, { audio: audioBase64 })) as {
+      result?: {
+        text?: string;
+        segments?: { start?: number; end?: number; text?: string }[];
+      };
     };
-    return { text: (json.result?.text ?? "").trim(), provider: model };
+    const segments = Array.isArray(json.result?.segments)
+      ? json.result.segments
+          .map((s) => ({
+            startSec: Number(s.start),
+            endSec: Number(s.end),
+            text: String(s.text ?? "").trim(),
+          }))
+          .filter(
+            (s) => s.text && Number.isFinite(s.startSec) && Number.isFinite(s.endSec) && s.endSec > s.startSec,
+          )
+      : [];
+    return { text: (json.result?.text ?? "").trim(), segments, provider: model };
   } catch (err) {
     // A silent failure here means a clip with no spoken subtitles and no
     // explanation; the caller records this on the spike.
-    return { text: "", provider: model, error: err instanceof Error ? err.message : String(err) };
+    return { text: "", segments: [], provider: model, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -133,6 +184,215 @@ export async function describeFrame(
   } catch (err) {
     return { text: "", provider: model, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+function medianOf(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+interface LoudnessSignal {
+  db: number[];
+  bucket: number;
+  /** spike-relative time of the first bucket */
+  start: number;
+}
+
+function loudnessSignal(input: MomentInput): LoudnessSignal | null {
+  if (!input.loudness || input.loudness.length < 10) return null;
+  const bucket = clamp(Number(input.loudnessBucketSec ?? 0.5), 0.2, 2);
+  return {
+    db: input.loudness,
+    bucket,
+    start: Number(input.windowStartSec ?? 0),
+  };
+}
+
+/**
+ * The loudest sustained point in the window is the reaction. Peaks that sit far
+ * away from the chat spike are ignored: the ring buffer can contain a louder
+ * intro or ad, and the spike is still why this moment exists.
+ */
+export function audioAnchor(input: MomentInput): { atSec: number; contrastDb: number } | null {
+  const signal = loudnessSignal(input);
+  if (!signal) return null;
+  const { db, bucket, start } = signal;
+
+  const smoothed = db.map((_, i) => {
+    const slice = db.slice(Math.max(0, i - 1), Math.min(db.length, i + 2));
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  });
+
+  const from = Math.max(start, -8);
+  const to = Math.min(start + db.length * bucket, 3);
+  const lo = Math.max(0, Math.ceil((from - start) / bucket));
+  const hi = Math.min(smoothed.length - 1, Math.floor((to - start) / bucket));
+  if (hi <= lo) return null;
+
+  const values = smoothed.slice(lo, hi + 1);
+  const max = Math.max(...values);
+  const median = medianOf(values);
+  const contrastDb = max - median;
+  // A stream with wall-to-wall music has no contrast to find; fall back to the
+  // chat peak instead of pretending its loudest second is a reaction.
+  if (contrastDb < 3) return null;
+
+  const index = values.findIndex((v) => v >= max - 2);
+  return {
+    atSec: clamp(start + (lo + index + 0.5) * bucket, -8, 2),
+    contrastDb,
+  };
+}
+
+/**
+ * Chooses up to three cuts: the setup around the reaction, the loudest beat, and
+ * a following beat when the moment keeps going. Peaks are separated and joined
+ * so the assembled clip never replays the same footage.
+ */
+export function planBeats(input: MomentInput, anchorSec: number): MomentBeat[] {
+  const maxTotal = clamp(input.maxClipSec ?? 24, 6, 60);
+  const fallbackStart = clamp(anchorSec - 3, -20, 4);
+  const fallback: MomentBeat[] = [
+    {
+      startSec: fallbackStart,
+      endSec: Math.min(fallbackStart + 14, fallbackStart + Math.max(6, maxTotal)),
+      score: 50,
+    },
+  ];
+
+  const signal = loudnessSignal(input);
+  if (!signal) return fallback;
+  const { db, bucket, start } = signal;
+
+  const smoothed = db.map((_, i) => {
+    const slice = db.slice(Math.max(0, i - 1), Math.min(db.length, i + 2));
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  });
+  const sorted = [...smoothed].sort((a, b) => a - b);
+  const quantile = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  const floor = quantile(0.3);
+  const ceiling = Math.max(floor + 2, quantile(0.92));
+  const normalised = smoothed.map((v) => clamp((v - floor) / (ceiling - floor), 0, 1));
+
+  // Speech is worth keeping even when it is not the loudest thing in the room.
+  for (const segment of input.transcriptSegments ?? []) {
+    const from = Math.floor(segment.startSec / bucket);
+    const to = Math.ceil(segment.endSec / bucket);
+    for (let i = Math.max(0, from); i < Math.min(normalised.length, to); i++) {
+      normalised[i] = Math.min(1.2, normalised[i] + 0.18);
+    }
+  }
+
+  // Only look around the moment; the window may hold a louder unrelated intro.
+  const fromSec = Math.max(0, -10 - start);
+  const toSec = Math.min(db.length * bucket, 14 - start);
+  const lo = Math.max(1, Math.floor(fromSec / bucket));
+  const hi = Math.min(normalised.length - 2, Math.ceil(toSec / bucket));
+
+  const peaks: { atSec: number; score: number }[] = [];
+  for (let i = lo; i <= hi; i++) {
+    if (normalised[i] < 0.55) continue;
+    if (normalised[i] < normalised[i - 1] || normalised[i] < normalised[i + 1]) continue;
+    peaks.push({ atSec: start + (i + 0.5) * bucket, score: normalised[i] });
+  }
+  peaks.sort((a, b) => b.score - a.score);
+
+  const chosen: { atSec: number; score: number }[] = [];
+  for (const peak of peaks) {
+    if (chosen.length >= 3) break;
+    if (chosen.some((other) => Math.abs(other.atSec - peak.atSec) < 4.5)) continue;
+    chosen.push(peak);
+  }
+  if (!chosen.length) return fallback;
+
+  // Prefer to start and end on a spoken boundary so subtitles and cuts agree.
+  const offset = Number(input.windowStartSec ?? 0);
+  const bounds = (input.transcriptSegments ?? []).flatMap((s) => [
+    offset + s.startSec,
+    offset + s.endSec,
+  ]);
+  const snap = (t: number) => {
+    let best = t;
+    let bestGap = 1.1;
+    for (const bound of bounds) {
+      const gap = Math.abs(bound - t);
+      if (gap < bestGap) {
+        best = bound;
+        bestGap = gap;
+      }
+    }
+    return best;
+  };
+
+  let beats: MomentBeat[] = chosen
+    .map((peak) => {
+      let beatStart = snap(peak.atSec - 3.5);
+      let beatEnd = snap(peak.atSec + 3.5);
+      if (beatEnd - beatStart < 4) {
+        beatStart = peak.atSec - 2;
+        beatEnd = peak.atSec + 3;
+      }
+      return {
+        startSec: clamp(beatStart, -20, 40),
+        endSec: clamp(beatEnd, -20, 45),
+        score: Math.min(100, Math.round(peak.score * 100)),
+      };
+    })
+    .sort((a, b) => a.startSec - b.startSec);
+
+  // Overlapping beats are one cut; replaying the same footage is not an edit.
+  const merged: MomentBeat[] = [];
+  for (const beat of beats) {
+    const previous = merged[merged.length - 1];
+    if (previous && beat.startSec <= previous.endSec + 0.4) {
+      previous.endSec = Math.max(previous.endSec, beat.endSec);
+    } else {
+      merged.push({ ...beat });
+    }
+  }
+  beats = merged;
+
+  while (beats.length > 1 && beats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0) > maxTotal) {
+    const weakest = beats.reduce((a, b) => (b.score < a.score ? b : a));
+    beats = beats.filter((b) => b !== weakest);
+  }
+
+  if (beats.length === 1 && beats[0].endSec - beats[0].startSec > maxTotal) {
+    const middle = (beats[0].startSec + beats[0].endSec) / 2;
+    beats[0] = {
+      ...beats[0],
+      startSec: middle - maxTotal / 2,
+      endSec: middle + maxTotal / 2,
+    };
+  }
+
+  return beats.length ? beats : fallback;
+}
+
+/** Remap Whisper segments onto the assembled clip's own timeline. */
+export function captionsForBeats(
+  segments: SpokenSegment[],
+  windowStartSec: number,
+  beats: MomentBeat[],
+): TimedCaption[] {
+  const out: TimedCaption[] = [];
+  let cursor = 0;
+  for (const beat of beats) {
+    for (const segment of segments) {
+      const from = Math.max(beat.startSec, windowStartSec + segment.startSec);
+      const to = Math.min(beat.endSec, windowStartSec + segment.endSec);
+      if (to - from < 0.3) continue;
+      out.push({
+        startSec: cursor + (from - beat.startSec),
+        endSec: cursor + (to - beat.startSec),
+        text: segment.text,
+      });
+    }
+    cursor += beat.endSec - beat.startSec;
+  }
+  return out;
 }
 
 /**
@@ -191,6 +451,8 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
   const captions = heuristicCaptions(input, category);
   const titles = heuristicTitles(input, category);
   const seed = Math.abs(Math.round(input.ts / 7)) % captions.length;
+  const anchorSec = audioAnchor(input)?.atSec ?? 0;
+  const beats = planBeats(input, anchorSec);
   return {
     summary: reasoning,
     whyChatReacted:
@@ -200,10 +462,13 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
     category: category as MomentAnalysis["category"],
     qualityScore: score,
     funniness: category === "funny" ? clamp(score + 6, 0, 100) : clamp(score - 18, 0, 100),
-    // Offsets from the spike peak, not timestamps: three seconds of lead-in and
-    // a few seconds after the reaction settles.
-    beginsAtSec: -3,
-    endsAtSec: 7,
+    // Offsets from the spike peak, not timestamps. The beats carry the actual
+    // cuts; this span is just their outer envelope for display and old callers.
+    beginsAtSec: beats[0].startSec,
+    endsAtSec: beats[beats.length - 1].endSec,
+    beats,
+    anchorSec,
+    funnySegmentIndices: [],
     title: titles[seed % titles.length],
     caption: captions[seed],
     hashtags: ["#twitch", "#clips", `#${(input.gameName ?? "gaming").toLowerCase().replace(/[^a-z0-9]/g, "")}`, "#fyp"],
@@ -212,12 +477,14 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
   };
 }
 
-const PROMPT = `You analyse Twitch stream signals to decide whether a moment is worth clipping for TikTok/Shorts/Reels.
+const PROMPT = `You are the editor of a Twitch highlights channel. Your audience is gamers scrolling TikTok/Shorts/Reels, not the streamer.
 Reply with JSON only, no prose, matching this shape:
-{"summary":"one sentence on what happened in the clip","whyChatReacted":"one sentence on the chat reaction","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"beginsAtSec":number,"endsAtSec":number,"title":"short title","caption":"ALL CAPS caption under 60 chars","hashtags":["#tag"]}
+{"summary":"one sentence on what happened in the clip","whyChatReacted":"one sentence on the chat reaction","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"funnySegmentIndices":[0],"beginsAtSec":number,"endsAtSec":number,"title":"short title","caption":"ALL CAPS caption under 60 chars","hashtags":["#tag"]}
 Rules:
-- beginsAtSec and endsAtSec are OFFSETS IN SECONDS FROM THE SPIKE PEAK, not timestamps. 0 is the peak, negative is footage before it.
-- Choose the span that contains the actual action and nothing else: usually -4 to +8 seconds, up to 25 seconds for a longer play. Never pad the clip.
+- Read the transcript segments. Pick the 1-3 segments a gaming audience would actually find funny or impressive: a punchline, a rage, a fail, an unexpected outcome, a clutch callout. Rank them best first in funnySegmentIndices and use only the supplied [n] indices. If nothing is genuinely funny or impressive, return [].
+- Do not pick greetings, thanks, sub/donation callouts, reading the game UI, or setup with no payoff. Do not pick a line that only makes sense with context that is not in the transcript.
+- The clip is cut around the chosen lines, so the pick matters more than the wording.
+- beginsAtSec and endsAtSec are OFFSETS IN SECONDS FROM THE SPIKE PEAK, not timestamps. 0 is the peak, negative is footage before it. They are advisory: the cuts come from funnySegmentIndices.
 - title and caption describe what HAPPENED IN THE VIDEO: the play, the reaction, the outcome. Never mention chat, viewers, donations or "chat going wild" - the chat is only how the moment was found, it is not the story.
 - Prefer concrete wording (the play, the game, the outcome) over generic hype.`;
 
@@ -237,13 +504,24 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
   if (!e.AI_MODEL && !aiConfigured(e)) return fallback;
 
   const model = e.AI_MODEL || DEFAULT_AI_MODEL;
+  const offset = Number(input.windowStartSec ?? 0);
+  const timedTranscript = (input.transcriptSegments ?? [])
+    .map(
+      (segment, index) =>
+        `[${index}] ${(offset + segment.startSec).toFixed(1)}s to ${(offset + segment.endSec).toFixed(1)}s: ${segment.text}`,
+    )
+    .join("\n");
   const context = [
     `Channel: ${input.channelName}`,
     `Game: ${input.gameName ?? "unknown"}`,
     `Stream title: ${input.streamTitle ?? "unknown"}`,
     `Chat features: ${JSON.stringify(input.features)}`,
     `Chat sample:\n${input.messages.slice(0, 18).join("\n")}`,
-    input.transcript ? `Audio transcript: ${input.transcript.slice(0, 800)}` : "",
+    timedTranscript
+      ? `Transcript segments (times relative to the spike peak):\n${timedTranscript.slice(0, 2400)}`
+      : input.transcript
+        ? `Audio transcript: ${input.transcript.slice(0, 800)}`
+        : "No speech transcript available.",
     input.visualNotes?.length
       ? `Sampled frames:\n${input.visualNotes.map((v, i) => `frame ${i + 1}: ${v}`).join("\n")}`
       : "No visual analysis available - judge from chat and audio only.",
@@ -264,6 +542,17 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
     const parsed = safeParse(json.result?.response ?? "");
     if (!parsed) return fallback;
 
+    const rawIndices = (parsed as { funnySegmentIndices?: unknown }).funnySegmentIndices;
+    const indexList = Array.isArray(rawIndices)
+      ? rawIndices
+      : typeof rawIndices === "string"
+        ? rawIndices.split(/[,\s]+/)
+        : [];
+    const funnySegmentIndices = indexList
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value >= 0)
+      .slice(0, 3);
+
     const score = clamp(Math.round(Number(parsed.qualityScore ?? fallback.qualityScore)), 0, 100);
     return {
       summary: String(parsed.summary ?? fallback.summary).slice(0, 400),
@@ -272,8 +561,13 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
       category: (parsed.category as MomentAnalysis["category"]) ?? fallback.category,
       qualityScore: score,
       funniness: clamp(Math.round(Number(parsed.funniness ?? fallback.funniness)), 0, 100),
-      beginsAtSec: Number(parsed.beginsAtSec ?? fallback.beginsAtSec),
-      endsAtSec: Number(parsed.endsAtSec ?? fallback.endsAtSec),
+      // The audio plan is grounded in when the reaction happened; the model's
+      // span is a guess made without timings, so the plan wins.
+      beginsAtSec: fallback.beginsAtSec,
+      endsAtSec: fallback.endsAtSec,
+      beats: fallback.beats,
+      anchorSec: fallback.anchorSec,
+      funnySegmentIndices,
       title: String(parsed.title ?? fallback.title).slice(0, 90),
       caption: String(parsed.caption ?? fallback.caption).slice(0, 90).toUpperCase(),
       hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags.slice(0, 6).map(String) : fallback.hashtags,

@@ -678,9 +678,14 @@ export class Collector {
         0,
         Math.min(ts - lead - snap.startSec, Math.max(0, snap.durationSec - 3)),
       );
-      const window = Math.min(45, Math.max(2, snap.durationSec - startInSnap));
+      // 30s keeps Whisper inside its reliable input size and still leaves
+      // roughly fifteen seconds either side of the spike for the beat plan.
+      const window = Math.min(30, Math.max(2, snap.durationSec - startInSnap));
 
       workDir = await mkdtemp(path.join(tmpdir(), "clipforge-live-"));
+      // Where the analysed window starts on the spike's own timeline. The
+      // analyser uses it to place audio peaks and speech on the footage.
+      const windowStartSec = snap.startSec + startInSnap - ts;
       const analysis = await analyseLocal(
         this.api,
         spikeId,
@@ -689,6 +694,7 @@ export class Collector {
         window,
         settings.frameSampleFps,
         workDir,
+        windowStartSec,
       );
 
       if (!analysis) {
@@ -708,7 +714,10 @@ export class Collector {
         return;
       }
       if (!analysis.transcript) {
-        log(`no speech transcript for ${state.login} - clip gets the caption card, not spoken subtitles`);
+        log(
+          `no speech transcript for ${state.login} - clip gets the caption card, not spoken subtitles` +
+            (analysis.sttError ? `: ${analysis.sttError.slice(0, 240)}` : ""),
+        );
       }
 
       await produceClipFromFile({
@@ -720,6 +729,8 @@ export class Collector {
         settings,
         workDir,
         transcript: analysis.transcript,
+        beats: analysis.beats,
+        captions: analysis.captions,
       });
     } catch (err) {
       log(`live capture failed for ${state.login}: ${err instanceof Error ? err.message : String(err)}`);

@@ -1,6 +1,6 @@
 import { db, env, getSettings } from "@/lib/db";
-import { analyzeMoment, describeFrame, transcribe } from "@/lib/ai";
-import type { MomentInput } from "@/lib/ai";
+import { analyzeMoment, captionsForBeats, describeFrame, transcribe } from "@/lib/ai";
+import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
 import type { Channel, Clip, Spike } from "@/lib/types";
@@ -14,6 +14,11 @@ interface AnalyzeBody {
   audioBase64?: string;
   /** optional pre-existing transcript */
   transcript?: string;
+  /** start of the sampled footage, relative to the spike peak */
+  windowStartSec?: number;
+  /** dBFS per bucket across the sampled footage */
+  loudness?: number[];
+  loudnessBucketSec?: number;
 }
 
 const MAX_FRAMES = 3;
@@ -76,12 +81,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     let transcript = body.transcript ?? "";
     let sttProvider = "none";
     let sttError: string | null = null;
+    let segments: SpokenSegment[] = [];
     if (!transcript && body.audioBase64 && body.audioBase64.length < MAX_AUDIO_CHARS) {
-      const binary = Uint8Array.from(atob(body.audioBase64), (c) => c.charCodeAt(0));
-      const stt = await transcribe(e, binary.buffer);
+      const stt = await transcribe(e, body.audioBase64);
       if (stt?.text) {
         transcript = stt.text;
         sttProvider = stt.provider;
+        segments = stt.segments;
       } else if (stt?.error) {
         // Recorded instead of swallowed: no transcript means no spoken
         // subtitles, and the operator should be able to see why.
@@ -90,6 +96,14 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     }
 
     await d.prepare("UPDATE spikes SET status = 'analyzing' WHERE id = ?").bind(id).run();
+
+    const windowStartSec = Math.max(-30, Math.min(0, Number(body.windowStartSec) || 0));
+    const loudnessBucketSec = Math.max(0.2, Math.min(2, Number(body.loudnessBucketSec) || 0.5));
+    const loudness = (body.loudness ?? [])
+      .slice(0, 200)
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v));
+    const maxClipSec = Math.max(8, Math.min(60, settings.clipDurationSec));
 
     const input: MomentInput = {
       channelName: channel?.display_name ?? spike.channel_login,
@@ -100,14 +114,102 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       messages: samples,
       visualNotes,
       transcript,
+      windowStartSec,
+      loudness,
+      loudnessBucketSec,
+      transcriptSegments: segments,
+      maxClipSec,
     };
 
     const analysis = await analyzeMoment(e, input);
 
+    // --- beat plan -------------------------------------------------------
+    // The model's transcript picks win: cut around the lines it judged funniest
+    // for a gaming audience. The audio plan is the fallback when it picked
+    // nothing usable.
+    const sampledSec = loudness.length ? loudness.length * loudnessBucketSec : 30;
+    const windowEndSec = windowStartSec + Math.max(10, sampledSec);
+    const picked = (analysis.funnySegmentIndices ?? [])
+      .slice(0, 3)
+      .map((index, rank) => {
+        const segment = segments[index];
+        if (!segment) return null;
+        const beat: MomentBeat = {
+          startSec: windowStartSec + segment.startSec - 1.5,
+          endSec: windowStartSec + segment.endSec + 2,
+          score: 100 - rank,
+        };
+        return beat;
+      })
+      .filter((beat): beat is MomentBeat => beat !== null);
+
+    const cleanBeats: MomentBeat[] = [];
+    for (const raw of picked.length ? picked : (analysis.beats ?? [])) {
+      const start = Number(raw.startSec);
+      const end = Number(raw.endSec);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      // A model pick can be late in the window; do not drag it back to the
+      // spike, or the cut stops containing the line that was chosen.
+      const from = Math.max(windowStartSec, start);
+      const to = Math.max(from + 3, Math.min(windowEndSec, end));
+      if (to - from < 3) continue;
+      cleanBeats.push({ startSec: from, endSec: to, score: Number(raw.score) || 0 });
+    }
+    cleanBeats.sort((a, b) => a.startSec - b.startSec);
+
+    const mergedBeats: MomentBeat[] = [];
+    for (const beat of cleanBeats) {
+      const previous = mergedBeats[mergedBeats.length - 1];
+      if (previous && beat.startSec <= previous.endSec + 0.4) {
+        previous.endSec = Math.max(previous.endSec, beat.endSec);
+      } else {
+        mergedBeats.push({ ...beat });
+      }
+    }
+
+    while (
+      mergedBeats.length > 1 &&
+      mergedBeats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0) > maxClipSec
+    ) {
+      const weakest = mergedBeats.reduce((a, b) => (b.score < a.score ? b : a));
+      mergedBeats.splice(mergedBeats.indexOf(weakest), 1);
+    }
+
+    let beats = mergedBeats;
+    if (!beats.length) {
+      const from = Math.max(windowStartSec, Math.min(4, analysis.beginsAtSec));
+      beats = [
+        {
+          startSec: from,
+          endSec: Math.max(from + 6, Math.min(windowEndSec, analysis.endsAtSec)),
+          score: 50,
+        },
+      ];
+    }
+    if (beats.length === 1 && beats[0].endSec - beats[0].startSec < 6) {
+      beats[0] = { ...beats[0], endSec: Math.min(windowEndSec, beats[0].startSec + 6) };
+    }
+
+    const assembledSec = beats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0);
+    analysis.beginsAtSec = beats[0].startSec;
+    analysis.endsAtSec = beats[beats.length - 1].endSec;
+    analysis.beats = beats;
+    const captions = captionsForBeats(segments, windowStartSec, beats);
+
     await d
       .prepare("UPDATE spikes SET ai_json = ?, ai_provider = ?, status = ? WHERE id = ?")
       .bind(
-        JSON.stringify({ ...analysis, visualNotes, transcript, sttProvider, sttError, visionError }),
+        JSON.stringify({
+          ...analysis,
+          visualNotes,
+          transcript,
+          transcriptSegments: segments,
+          captions,
+          windowStartSec,
+          sttProvider,
+          sttError,
+          visionError,
+        }),
         analysis.provider,
         analysis.qualityScore >= settings.minQualityScore ? "rendering" : "skipped",
         id,
@@ -124,6 +226,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         reason: `quality ${analysis.qualityScore} below floor ${settings.minQualityScore}`,
         analysis,
         transcript,
+        sttError,
       });
     }
 
@@ -133,29 +236,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .bind(id)
       .first<{ id: string }>();
     if (existing) {
-      return json({ ok: true, clipId: existing.id, analysis, existing: true });
+      return json({ ok: true, clipId: existing.id, analysis, existing: true, beats, captions, sttError });
     }
 
     const clipId = crypto.randomUUID();
     const now = new Date().toISOString();
-    // The analyser reports the moment's span as offsets from the spike peak.
-    // Earlier replies carried absolute timestamps, so rebase those rather than
-    // producing a clip decades long.
-    const rebase = (value: unknown, fallback: number): number => {
-      const n = Number(value);
-      if (!Number.isFinite(n)) return fallback;
-      return n > 1_000_000_000 ? n - spike.ts_unix : n;
-    };
-    const beginsAt = Math.max(-20, Math.min(4, rebase(analysis.beginsAtSec, -settings.preEventSec)));
-    const endsAt = Math.max(
-      beginsAt + 6,
-      Math.min(beginsAt + 45, rebase(analysis.endsAtSec, beginsAt + settings.clipDurationSec)),
-    );
-    // The duration setting is the ceiling, not the target: a short reaction
-    // stays short instead of being padded to it.
-    const maxSpan = Math.max(8, Math.min(60, settings.clipDurationSec));
-    const durationSec = Math.max(6, Math.min(maxSpan, endsAt - beginsAt));
+    // The duration setting is the ceiling, not the target: the joined cuts are
+    // as long as the beats are, never padded to fill it.
+    const beginsAt = beats[0].startSec;
+    const durationSec = Math.max(6, Math.min(maxClipSec, assembledSec));
     const startOffset = Math.max(0, spike.ts_unix + beginsAt);
+    const endOffset = startOffset + durationSec;
 
     await d
       .prepare(
@@ -190,7 +281,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         analysis.model,
         spike.ts_unix,
         startOffset,
-        startOffset + durationSec,
+        endOffset,
         transcript || null,
         now,
         now,
@@ -198,7 +289,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .run();
 
     const clip = await d.prepare("SELECT * FROM clips WHERE id = ?").bind(clipId).first<Clip>();
-    return json({ ok: true, clipId, clip, analysis, transcript });
+    return json({ ok: true, clipId, clip, analysis, transcript, beats, captions, sttError });
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }

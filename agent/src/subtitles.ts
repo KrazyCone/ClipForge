@@ -112,6 +112,90 @@ export function buildAss(
   return header + events.join("\n") + "\n";
 }
 
+export interface TimedCaption {
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+/** Header block shared by the transcript and timed-card builders. */
+function headerFor(style: keyof typeof STYLES): string {
+  const s = STYLES[style] ?? STYLES.bold;
+  return ASS_HEADER.replace("{font}", "DejaVu Sans")
+    .replace("{size}", String(s.size))
+    .replace("{outline}", String(s.outline))
+    .replace("{shadow}", String(s.shadow))
+    .replace("{back}", s.back)
+    .replace("{margin}", "220");
+}
+
+/** Split one utterance into at most two-line cards. */
+function phraseCards(text: string): string[] {
+  const cards: string[][] = [];
+  let current: string[] = [];
+  for (const word of text.replace(/[{}]/g, "").split(" ")) {
+    const lastLine = current[current.length - 1];
+    if (lastLine !== undefined && `${lastLine} ${word}`.length <= 26) {
+      current[current.length - 1] = `${lastLine} ${word}`;
+    } else if (current.length < 2) {
+      current.push(word);
+    } else {
+      cards.push(current);
+      current = [word];
+    }
+    if (/[.!?]$/.test(word)) {
+      cards.push(current);
+      current = [];
+    }
+  }
+  if (current.length) cards.push(current);
+  return cards.map((lines) => lines.join("\\N"));
+}
+
+/**
+ * Builds subtitles whose cards keep the timings Whisper reported. The renderer
+ * joins several cuts and passes captions already remapped onto that timeline,
+ * so a card can never drift onto footage it was not spoken over.
+ */
+export function buildAssTimed(
+  captions: TimedCaption[],
+  durationSec: number,
+  style: keyof typeof STYLES = "bold",
+): string {
+  const s = STYLES[style] ?? STYLES.bold;
+  const header = headerFor(style);
+  const events: string[] = [];
+  let cursor = 0;
+
+  for (const caption of captions) {
+    const text = caption.text.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const start = Math.max(0, Math.min(durationSec - 0.2, caption.startSec));
+    const end = Math.max(start + 0.2, Math.min(durationSec, caption.endSec));
+    if (end - start < 0.2) continue;
+
+    const phrases = phraseCards(text);
+    if (!phrases.length) continue;
+    const weights = phrases.map((p) => p.replace(/\\N/g, " ").length || 1);
+    const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+    let t = Math.max(start, cursor);
+    phrases.forEach((phrase, index) => {
+      const span = ((end - start) * weights[index]) / totalWeight;
+      const from = t;
+      const to = Math.min(end, t + span * 0.96);
+      t += span;
+      if (to <= from + 0.05) return;
+      events.push(
+        `Dialogue: 0,${assTime(from)},${assTime(to)},ClipForge,,0,0,0,,{\\c${s.colour}\\bord${s.outline}}${phrase}`,
+      );
+    });
+    cursor = Math.max(cursor, end);
+  }
+
+  return header + events.join("\n") + "\n";
+}
+
 /** Caption card shown at the top of the clip when there is no transcript. */
 export function buildCaptionAss(caption: string, durationSec: number): string {
   const s = STYLES.bold;

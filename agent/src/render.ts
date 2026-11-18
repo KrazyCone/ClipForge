@@ -11,10 +11,17 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { log } from "./config.js";
-import type { AgentSettings, ClipforgeApi, QueueClip, QueueSpike } from "./api.js";
+import type {
+  AgentSettings,
+  AnalyzeBeat,
+  ClipforgeApi,
+  QueueClip,
+  QueueSpike,
+  TimedCaption,
+} from "./api.js";
 import type { TwitchVod } from "./twitch.js";
-import { extractAudio, renderClip, sampleFrames, thumbnail } from "./ffmpeg.js";
-import { buildAss, buildCaptionAss } from "./subtitles.js";
+import { audioLoudness, extractAudio, renderClip, sampleFrames, thumbnail } from "./ffmpeg.js";
+import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
 
 /**
  * Twitch only publishes a broadcast as an archive VOD once the stream ends, so
@@ -81,12 +88,16 @@ async function analyzeSpike(
 
   const frames = await sampleFrames(playlist, start, 30, 0.4, workDir);
   const audio = await extractAudio(playlist, start, 30, workDir);
+  const loudness = await audioLoudness(playlist, start, 30).catch(() => []);
 
   log(`spike ${spike.id}: sampled ${frames.length} frames, audio ${audio ? audio.length : 0} bytes`);
 
   const result = await api.analyze(spike.id, {
     frames: frames.map((f) => f.toString("base64")),
     audioBase64: audio ? audio.toString("base64") : undefined,
+    windowStartSec: start - found.offset,
+    loudness: loudness.map((sample) => Math.round(sample.db * 10) / 10),
+    loudnessBucketSec: 0.5,
   });
 
   if (result.skipped) {
@@ -129,15 +140,43 @@ async function renderClipJob(
   // start_offset may sit before or after the spike, so translate it into the
   // VOD rather than always rewinding from the spike.
   const start = Math.max(0, found.offset + (startOffset - clip.source_ts));
-  const duration = Math.max(6, Math.min(60, endOffset - startOffset));
+
+  // The analyser stored the cuts and the remapped subtitles with the spike, so
+  // a VOD render joins the same beats the live path would have used.
+  let beats: AnalyzeBeat[] = [];
+  let captions: TimedCaption[] = [];
+  try {
+    const ai = JSON.parse(clip.spike_ai_json ?? "{}") as {
+      beats?: AnalyzeBeat[];
+      captions?: TimedCaption[];
+    };
+    if (Array.isArray(ai.beats)) beats = ai.beats;
+    if (Array.isArray(ai.captions)) captions = ai.captions;
+  } catch {
+    // An older clip has no plan; the single stored span below still works.
+  }
+
+  const cuts = beats
+    .map((beat) => {
+      const from = Math.max(0, found.offset + beat.startSec);
+      const to = Math.max(from + 1, found.offset + beat.endSec);
+      return { startSec: from, durationSec: to - from };
+    })
+    .filter((cut) => cut.durationSec >= 2);
+  const joined = cuts.length > 1;
+  const duration = joined
+    ? Math.round(cuts.reduce((sum, cut) => sum + cut.durationSec, 0) * 10) / 10
+    : Math.max(6, Math.min(60, endOffset - startOffset));
 
   // Transcript was captured during analysis and stored on the clip.
   const transcript = clip.transcript ?? "";
 
   const assPath = path.join(workDir, "subs.ass");
-  const ass = transcript
-    ? buildAss(transcript, duration, settings.subtitleStyle)
-    : buildCaptionAss(clip.caption ?? clip.title ?? "", duration);
+  const ass = captions.length
+    ? buildAssTimed(captions, duration, settings.subtitleStyle)
+    : transcript && !joined
+      ? buildAss(transcript, duration, settings.subtitleStyle)
+      : buildCaptionAss(clip.caption ?? clip.title ?? "", duration);
   await writeFile(assPath, ass, "utf8");
 
   const outPath = path.join(workDir, "clip.mp4");
@@ -145,6 +184,7 @@ async function renderClipJob(
     input: playlist,
     startSec: start,
     durationSec: duration,
+    segments: joined ? cuts : undefined,
     outPath,
     assPath,
     aspect: settings.aspectRatio,
@@ -163,7 +203,10 @@ async function renderClipJob(
     height: settings.aspectRatio === "9:16" ? 1920 : 1080,
   });
 
-  log(`clip ${clip.id}: rendered ${(video.length / 1048576).toFixed(1)} MB, ${duration.toFixed(1)}s`);
+  log(
+    `clip ${clip.id}: rendered ${(video.length / 1048576).toFixed(1)} MB, ${duration.toFixed(1)}s` +
+      (joined ? ` joined from ${cuts.length} cuts` : ""),
+  );
   return "done";
 }
 
