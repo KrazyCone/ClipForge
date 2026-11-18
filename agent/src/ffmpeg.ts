@@ -134,6 +134,39 @@ export function ffprobeHasAudio(file: string): Promise<boolean> {
   });
 }
 
+/** First presentation time of each stream in the source. */
+export function ffprobeStreamStarts(
+  file: string,
+): Promise<{ video: number; audio: number } | null> {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      "ffprobe",
+      [
+        "-v", "error",
+        "-show_entries", "stream=codec_type,start_time",
+        "-of", "json",
+        file,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let out = "";
+    proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
+    proc.on("error", () => resolve(null));
+    proc.on("close", () => {
+      try {
+        const streams = (JSON.parse(out) as { streams?: { codec_type?: string; start_time?: string }[] })
+          .streams ?? [];
+        const video = streams.find((s) => s.codec_type === "video");
+        const audio = streams.find((s) => s.codec_type === "audio");
+        if (!video || !audio) return resolve(null);
+        resolve({ video: Number(video.start_time) || 0, audio: Number(audio.start_time) || 0 });
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
 /** Audio and video durations of a finished file, for sync verification. */
 export function ffprobeStreamDurations(
   file: string,
@@ -285,24 +318,48 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     return;
   }
 
+  // A source can have one stream starting before the other (a live snapshot
+  // whose first segment carries audio first is the usual case). Left alone,
+  // the clip starts with audio-only time: the player holds the first frame
+  // while the audio runs. Trim the leading audio to the first video frame and
+  // trim both streams to the same length.
+  const durationStr = opts.durationSec.toFixed(3);
+  let audioLead = 0;
+  if (segments.length <= 1) {
+    const starts = await ffprobeStreamStarts(opts.input).catch(() => null);
+    if (starts) {
+      // Only a real gap, not encoder priming: anything longer than a frame or
+      // two means the picture genuinely starts later than the sound.
+      audioLead = Math.min(2, Math.max(0, starts.video - starts.audio));
+      if (audioLead < 0.08) audioLead = 0;
+    }
+  }
+  const normalisedVideo = `setpts=PTS-STARTPTS,fps=30,trim=duration=${durationStr},setpts=PTS-STARTPTS`;
+  const normalisedAudio =
+    `asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,` +
+    `atrim=start=${audioLead.toFixed(3)},asetpts=PTS-STARTPTS,` +
+    `atrim=duration=${durationStr},asetpts=PTS-STARTPTS`;
+
   let filterComplex: string;
   if (webcam) {
-    filterComplex = webcamChains("0:v", webcam, "v", opts.assPath).join(";");
+    filterComplex = webcamChains("0:v", webcam, "v", opts.assPath, durationStr).join(";");
   } else {
     if (opts.assPath) videoFilter += `,${assFilter(opts.assPath)}`;
-    filterComplex = `[0:v]${videoFilter}[v]`;
+    filterComplex = `[0:v]${normalisedVideo},${videoFilter}[v]`;
   }
 
   await ffmpeg([
     "-hide_banner",
     "-loglevel", "error",
     "-ss", opts.startSec.toFixed(2),
-    "-t", opts.durationSec.toFixed(2),
+    // Extra read so the leading audio can be dropped without shortening the
+    // clip on sources whose video starts late.
+    "-t", (opts.durationSec + audioLead + 0.5).toFixed(2),
     "-i", opts.input,
     "-filter_complex", filterComplex,
     "-map", "[v]",
     "-map", "0:a?",
-    "-af", "aresample=48000:async=1:first_pts=0",
+    "-af", normalisedAudio,
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "21",
@@ -336,10 +393,15 @@ function webcamChains(
   box: WebcamBox,
   outLabel: string,
   assPath: string | null,
+  /** set for a single cut: normalise the source before splitting it */
+  durationStr?: string,
 ): string[] {
   const f = (n: number) => n.toFixed(4);
+  const prep = durationStr
+    ? `setpts=PTS-STARTPTS,fps=30,trim=duration=${durationStr},setpts=PTS-STARTPTS`
+    : `fps=30`;
   return [
-    `[${source}]fps=30,split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
+    `[${source}]${prep},split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
     `[wcFaceSrc]crop=iw*${f(box.w)}:ih*${f(box.h)}:iw*${f(box.x)}:ih*${f(box.y)},` +
       `scale=1080:600:force_original_aspect_ratio=increase,crop=1080:600,setsar=1[wcFace]`,
     `[wcGameSrc]scale=1080:1320:force_original_aspect_ratio=decrease[wcGameFit]`,

@@ -571,6 +571,7 @@ function ClipModal({
               poster={clip.thumb_key ? `/api/media/${clip.thumb_key}` : undefined}
               controls
               autoPlay
+              preload="auto"
               playsInline
             />
           ) : (
