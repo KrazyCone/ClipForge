@@ -8,7 +8,7 @@
  * path takes over - which is why a clip can land while the stream is still live.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readdir, stat, unlink, writeFile, mkdtemp } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, unlink, writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ffmpeg, ffprobeDuration } from "./ffmpeg.js";
@@ -20,12 +20,19 @@ export interface Snapshot {
   /** unix seconds of the first frame in that file */
   startSec: number;
   durationSec: number;
+  /** temp directory holding the concatenated file - the caller must remove it */
+  workDir: string;
 }
+
+/** No new segment for this long means the HLS copy has stalled, not that chat is quiet. */
+const STALL_MS = 45_000;
 
 export class LiveRecorder {
   private proc: ChildProcess | null = null;
   private sweep: NodeJS.Timeout | null = null;
+  private stallTimer: NodeJS.Timeout | null = null;
   private restart: NodeJS.Timeout | null = null;
+  private lastSegmentAt = Date.now();
   private stopping = false;
   private lastError = "";
   private dir: string;
@@ -52,12 +59,14 @@ export class LiveRecorder {
     await mkdir(this.dir, { recursive: true });
     this.spawn();
     this.sweep = setInterval(() => void this.cleanup(), 10_000);
+    this.stallTimer = setInterval(() => this.checkStall(), 15_000);
     log(`live buffer started for ${this.login} (${this.bufferSeconds}s window)`);
   }
 
   private spawn(): void {
     if (this.stopping) return;
     this.startedAt = Date.now();
+    this.lastSegmentAt = Date.now();
     this.lastError = "";
     const proc = spawn(
       "ffmpeg",
@@ -100,10 +109,34 @@ export class LiveRecorder {
     this.proc = proc;
   }
 
+  /**
+   * A days-long stream will eventually outlive something: the signed playlist
+   * token, the CDN connection, or the segment muxer. ffmpeg does not always
+   * exit when that happens - it just stops producing segments - so the writer
+   * has to be killed and respawned or live capture silently ends.
+   */
+  private checkStall(): void {
+    if (this.stopping || !this.proc || this.proc.exitCode !== null) return;
+    if (Date.now() - this.startedAt < STALL_MS) return;
+    const silentMs = Date.now() - this.lastSegmentAt;
+    if (silentMs < STALL_MS) return;
+    log(`live buffer for ${this.login}: no new segment for ${Math.round(silentMs / 1000)}s - restarting capture`);
+    try {
+      this.proc.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+
   /** Refresh the signed URL before respawning, so a 404 is not replayed forever. */
   private async restartNow(): Promise<void> {
     if (this.stopping) return;
-    if (this.failures >= 2 && this.refreshUrl) {
+    // The segment muxer numbers files from zero on every spawn, so a stale
+    // directory would be overwritten mid-read. A restart is a coverage gap
+    // anyway, so start clean.
+    await rm(this.dir, { recursive: true, force: true }).catch(() => {});
+    await mkdir(this.dir, { recursive: true }).catch(() => {});
+    if (this.failures >= 1 && this.refreshUrl) {
       try {
         this.playlistUrl = await this.refreshUrl();
         log(`live buffer for ${this.login}: playlist token refreshed`);
@@ -125,6 +158,7 @@ export class LiveRecorder {
         if (!name.endsWith(".ts")) continue;
         const full = path.join(this.dir, name);
         const info = await stat(full);
+        if (info.mtimeMs > this.lastSegmentAt) this.lastSegmentAt = info.mtimeMs;
         if (info.mtimeMs < cutoff) await unlink(full).catch(() => {});
       }
     } catch {
@@ -177,12 +211,13 @@ export class LiveRecorder {
     let duration = 0;
     for (const p of picked) duration += await ffprobeDuration(p.full);
 
-    return { file: out, startSec, durationSec: duration };
+    return { file: out, startSec, durationSec: duration, workDir: work };
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     if (this.sweep) clearInterval(this.sweep);
+    if (this.stallTimer) clearInterval(this.stallTimer);
     if (this.restart) clearTimeout(this.restart);
     try {
       this.proc?.kill("SIGKILL");

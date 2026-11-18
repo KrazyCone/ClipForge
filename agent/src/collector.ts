@@ -499,7 +499,11 @@ export class Collector {
         limit: 2,
         minSpikeAgeSec: 120,
       });
-      if (result.hadWork) log(`queue drain: ${describeDrain(result)}`);
+      // Deferrals are the normal state for a stream that has not ended, so only
+      // report passes that actually produced or lost something.
+      if (result.analyzed || result.rendered || result.errors.length) {
+        log(`queue drain: ${describeDrain(result)}`);
+      }
     } catch (err) {
       log(`queue drain failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -509,9 +513,13 @@ export class Collector {
 
   private bufferSeconds(): number {
     const settings = this.settings;
+    // Four minutes of headroom beyond the clip window: a burst can put several
+    // moments behind two render slots, and a queue that outlives the buffer is
+    // a moment that can never be cut while the stream is live. At 1080p this is
+    // roughly a quarter of a gigabyte per channel on the runner's disk.
     return Math.max(
-      120,
-      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 120,
+      240,
+      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 240,
     );
   }
 
@@ -620,15 +628,23 @@ export class Collector {
     this.liveRenders++;
 
     let workDir: string | null = null;
+    let snapDir: string | null = null;
     try {
       // Wait for the post-roll to be written into the buffer.
       await sleep((settings.postEventSec + 2) * 1000);
 
-      const snap = await recorder.snapshot(ts, settings.preEventSec, settings.postEventSec);
+      // The segment writer can be a couple of seconds behind, so give the
+      // buffer a few chances before declaring the moment uncuttable.
+      let snap = await recorder.snapshot(ts, settings.preEventSec, settings.postEventSec);
+      for (let attempt = 0; !snap && attempt < 3; attempt++) {
+        await sleep(3_000);
+        snap = await recorder.snapshot(ts, settings.preEventSec, settings.postEventSec);
+      }
       if (!snap) {
-        log(`no buffer coverage for ${state.login} - falling back to VOD`);
+        log(`no buffer coverage for ${state.login} - moment left for a later pass`);
         return;
       }
+      snapDir = snap.workDir;
 
       const startInSnap = Math.max(0, ts - settings.preEventSec - snap.startSec);
       const window = Math.min(45, settings.preEventSec + settings.postEventSec + 12);
@@ -665,6 +681,9 @@ export class Collector {
     } finally {
       this.liveRenders--;
       if (workDir) await cleanupWorkDir(workDir);
+      // Each snapshot is a concatenated copy of the moment; on a stream that
+      // runs for days, leaking one per clip fills the runner's disk.
+      if (snapDir) await cleanupWorkDir(snapDir);
       this.runPendingLive();
     }
   }

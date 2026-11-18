@@ -193,6 +193,12 @@ export async function drainQueue(opts: DrainOptions): Promise<DrainResult> {
   const spikes = queue.spikes.filter(
     (s) => !minSpikeAge || ageSeconds(s.ts_unix) >= minSpikeAge,
   );
+  // Twitch only publishes a broadcast as an archive once it ends, so a moment
+  // from a channel that is still live has nothing to cut from yet. Checking
+  // that here saves a pointless videos lookup on every pass of a long stream.
+  const liveLogins = new Set(
+    queue.channels.filter((c) => c.is_live === 1).map((c) => c.login.toLowerCase()),
+  );
   if (!spikes.length && !queue.clips.length) {
     result.hadWork = false;
     return result;
@@ -203,6 +209,10 @@ export async function drainQueue(opts: DrainOptions): Promise<DrainResult> {
   try {
     for (const spike of spikes) {
       try {
+        if (liveLogins.has(spike.channel_login.toLowerCase())) {
+          result.deferred++;
+          continue;
+        }
         const outcome = await analyzeSpike(api, vod, spike, workDir);
         if (outcome === "done") result.analyzed++;
         else if (outcome === "deferred") result.deferred++;
