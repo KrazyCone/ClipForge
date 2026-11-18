@@ -40,6 +40,8 @@ export interface MomentInput {
   maxClipSec?: number;
   /** the operator's standing direction for every clip (picks, title, caption) */
   direction?: string;
+  /** chat looks like a poll or command vote, not a reaction */
+  pollHint?: string;
   /** prior assessment summary, used when regenerating copy */
   summary?: string;
 }
@@ -283,6 +285,16 @@ function loudnessSignal(input: MomentInput): LoudnessSignal | null {
  * away from the chat spike are ignored: the ring buffer can contain a louder
  * intro or ad, and the spike is still why this moment exists.
  */
+/** Loudness contrast around the moment, 0 when there is no usable audio. */
+export function loudnessContrast(
+  loudness: number[] | undefined,
+  bucketSec = 0.5,
+  windowStartSec = 0,
+): number {
+  const input = { loudness, loudnessBucketSec: bucketSec, windowStartSec } as unknown as MomentInput;
+  return audioAnchor(input)?.contrastDb ?? 0;
+}
+
 export function audioAnchor(input: MomentInput): { atSec: number; contrastDb: number } | null {
   const signal = loudnessSignal(input);
   if (!signal) return null;
@@ -554,7 +566,8 @@ Rules:
 - The clip is cut around the chosen lines, so the pick matters more than the wording.
 - beginsAtSec and endsAtSec are OFFSETS IN SECONDS FROM THE SPIKE PEAK, not timestamps. 0 is the peak, negative is footage before it. They are advisory: the cuts come from funnySegmentIndices.
 - title and caption describe what HAPPENED IN THE VIDEO: the play, the reaction, the outcome. Never mention chat, viewers, donations or "chat going wild" - the chat is only how the moment was found, it is not the story.
-- Prefer concrete wording (the play, the game, the outcome) over generic hype.`;
+- Prefer concrete wording (the play, the game, the outcome) over generic hype.
+- Repeating short answers (1, 2, A, B, yes, no, !vote) means chat is voting in a poll or running a command, not reacting. A poll is not a moment by itself: only pick a segment if something genuinely funny or impressive happens on stream during it. If nothing does, return [] and keep the funniness low.`;
 
 function safeParse(text: string): Partial<MomentAnalysis> | null {
   const start = text.indexOf("{");
@@ -585,6 +598,7 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
     `Stream title: ${input.streamTitle ?? "unknown"}`,
     `Chat features: ${JSON.stringify(input.features)}`,
     `Chat sample:\n${input.messages.slice(0, 18).join("\n")}`,
+    input.pollHint ? `Chat pattern: ${input.pollHint} - this is a vote, not a reaction.` : "",
     timedTranscript
       ? `Transcript segments (times relative to the spike peak):\n${timedTranscript.slice(0, 2400)}`
       : input.transcript

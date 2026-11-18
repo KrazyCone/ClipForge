@@ -4,9 +4,11 @@ import {
   captionsForBeats,
   describeFrame,
   detectWebcam,
+  loudnessContrast,
   transcribe,
 } from "@/lib/ai";
 import { boxFromHint, storedWebcam } from "@/lib/webcam";
+import { pollSignals } from "@/lib/poll";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -85,6 +87,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     } catch {
       samples = [];
     }
+    // Polls and command votes spike chat volume too; the content decides
+    // whether there is anything worth clipping.
+    const poll = pollSignals(samples);
 
     // --- visual analysis -------------------------------------------------
     const visualNotes: string[] = [];
@@ -164,6 +169,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       transcriptSegments: segments,
       maxClipSec,
       direction: settings.clipDirection,
+      pollHint: poll.likely ? poll.reason : undefined,
     };
 
     const analysis = await analyzeMoment(e, input);
@@ -187,6 +193,31 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         return beat;
       })
       .filter((beat): beat is MomentBeat => beat !== null);
+
+    // A vote is not a moment. Keep it only when the footage reacted: a spoken
+    // reaction, a loud beat, or a moment the model still scored highly.
+    if (poll.likely && picked.length === 0) {
+      const spokenReaction =
+        /(haha|laugh|lmao|lol|bruh|no way|what the|oh my god|are you serious|screaming|dying)/i.test(
+          transcript,
+        );
+      const audibleReaction = loudnessContrast(loudness, loudnessBucketSec, windowStartSec) >= 5;
+      const scored = analysis.qualityScore >= effectiveFloor || analysis.funniness >= 65;
+      if (!spokenReaction && !audibleReaction && !scored) {
+        await d
+          .prepare("UPDATE spikes SET ai_json = ?, ai_provider = ?, status = 'skipped' WHERE id = ?")
+          .bind(JSON.stringify({ ...analysis, poll }), analysis.provider, id)
+          .run();
+        return json({
+          ok: true,
+          skipped: true,
+          reason: `poll responses (${Math.round(poll.share * 100)}% "${poll.top}") with no reaction on stream`,
+          analysis,
+          transcript,
+          sttError,
+        });
+      }
+    }
 
     const cleanBeats: MomentBeat[] = [];
     for (const raw of picked.length ? picked : (analysis.beats ?? [])) {
@@ -254,6 +285,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           sttProvider,
           sttError,
           visionError,
+          poll,
         }),
         analysis.provider,
         analysis.qualityScore >= effectiveFloor ? "rendering" : "skipped",
