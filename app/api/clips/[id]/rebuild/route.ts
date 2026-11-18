@@ -26,21 +26,17 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
     }
 
     const [settings, feedback] = await Promise.all([getSettings(), getAllFeedback()]);
+    // Reprocessing works with or without a suggestion. With none, the moment is
+    // re-analysed and re-rendered using the saved defaults.
     const suggestion = summariseFeedback(feedback, settings).suggestion;
-    if (!suggestion) {
-      return json(
-        { error: "No suggestion yet — like or dislike a few clips first." },
-        400,
-      );
-    }
 
     await ensureAnalyzeColumn(d);
     await d
       .prepare("UPDATE spikes SET analyze_json = ?, status = 'queued' WHERE id = ?")
-      .bind(JSON.stringify(suggestion.patch), clip.spike_id)
+      .bind(suggestion ? JSON.stringify(suggestion.patch) : null, clip.spike_id)
       .run();
 
-    return json({ ok: true, queued: true, patch: suggestion.patch });
+    return json({ ok: true, queued: true, patch: suggestion?.patch ?? null });
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }

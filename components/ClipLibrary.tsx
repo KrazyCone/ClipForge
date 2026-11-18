@@ -16,6 +16,7 @@ import {
 } from "./icons";
 import { ClipFeedbackBox } from "./ClipFeedback";
 import { parseReasons, summariseFeedback } from "@/lib/feedback";
+import { parseWebcamBox } from "@/lib/webcam";
 import type {
   ClipFeedback,
   FeedbackSentiment,
@@ -484,6 +485,7 @@ export function ClipLibrary({
           onReprocess={() => reprocess(open)}
           onSave={(title, caption) => saveEdit(open, title, caption)}
           suggestion={summary.suggestion}
+          webcamFocus={current.webcamFocus}
           onRebuild={() => rebuild(open)}
           onApplySuggestion={applySuggestion}
           onFeedback={(next) =>
@@ -507,6 +509,7 @@ function ClipModal({
   feedback,
   busy,
   suggestion,
+  webcamFocus,
   onClose,
   onDelete,
   onRegenerate,
@@ -520,6 +523,7 @@ function ClipModal({
   feedback: ClipFeedback | null;
   busy: boolean;
   suggestion: FeedbackSuggestion | null;
+  webcamFocus: boolean;
   onClose: () => void;
   onDelete: () => void;
   onRegenerate: () => void;
@@ -560,40 +564,72 @@ function ClipModal({
 
         <div className="modal-suggest">
           <div className="spread" style={{ gap: 8 }}>
-            <span className="setting-label">Suggestion</span>
+            <span className="setting-label">Reprocess &amp; suggestions</span>
             {suggestion ? <Badge tone="neutral">from your feedback</Badge> : null}
           </div>
           {suggestion ? (
             <>
               <div style={{ fontSize: 12.5, fontWeight: 600 }}>{suggestion.headline}</div>
               <div className="setting-hint">{suggestion.detail}</div>
-              <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-                <button
-                  className="btn sm primary"
-                  disabled={busy || Boolean(clip.rebuild_pending)}
-                  onClick={onRebuild}
-                >
-                  <IconRefresh width={12} height={12} />{" "}
-                  {clip.rebuild_pending ? "Re-cut queued" : "Regenerate this clip"}
-                </button>
-                <button
-                  className="btn sm"
-                  onClick={() => onApplySuggestion(suggestion.patch)}
-                >
-                  Apply to all other clips
-                </button>
-              </div>
-              <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
-                {clip.rebuild_pending
-                  ? "Queued — waiting for the collector. The current cut stays playable until the new one replaces it."
-                  : "Regenerate re-cuts only this clip with the suggestion. Apply saves it as the default for every other clip and for new moments."}
-              </div>
             </>
           ) : (
             <div className="setting-hint">
-              Like or dislike a few clips and a suggestion for better cuts shows up here.
+              No suggestion yet — rate a few clips and one appears here. Reprocess works
+              either way.
             </div>
           )}
+
+          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            <button
+              className="btn sm primary"
+              disabled={busy || Boolean(clip.rebuild_pending)}
+              onClick={onRebuild}
+            >
+              <IconRefresh width={12} height={12} />{" "}
+              {clip.rebuild_pending ? "Re-cut queued" : "Reprocess this clip"}
+            </button>
+            <button
+              className="btn sm"
+              disabled={!suggestion || busy}
+              title={
+                suggestion
+                  ? "Save this change as the default for every other clip"
+                  : "Rate a few clips first — there is nothing to apply yet"
+              }
+              onClick={() => suggestion && onApplySuggestion(suggestion.patch)}
+            >
+              Apply to all other clips
+            </button>
+          </div>
+
+          <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
+            {clip.rebuild_pending
+              ? "Queued — waiting for the collector. The current cut stays playable until the new one replaces it."
+              : "Reprocess re-runs the transcription and cut for this clip only. Apply saves the suggestion for every other clip and for new moments."}
+          </div>
+          <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
+            {(() => {
+              const box = parseWebcamBox(clip.webcam_json);
+              if (!box) {
+                return "Webcam: none detected when this clip was analysed — Reprocess to try again.";
+              }
+              let region = "detected";
+              try {
+                const stored = JSON.parse(clip.webcam_json ?? "{}") as {
+                  region?: string;
+                  size?: string;
+                };
+                if (stored.region) {
+                  region = `${stored.region.replace("-", " ")}${stored.size ? `, ${stored.size}` : ""}`;
+                }
+              } catch {
+                /* keep the generic label */
+              }
+              return webcamFocus
+                ? `Webcam: ${region} — enlarged above the gameplay.`
+                : `Webcam: ${region} — enlargement is switched off in Settings.`;
+            })()}
+          </div>
         </div>
         </div>
 
@@ -694,14 +730,14 @@ function ClipModal({
               <IconSparkle width={12} height={12} /> New caption
             </button>
             {clip.status === "ready" ? (
-              <>
-                <a className="btn sm" href={`/api/clips/${clip.id}/download`}>
-                  <IconDownload width={12} height={12} /> MP4
-                </a>
-                <button className="btn sm" disabled={busy} onClick={onReprocess}>
-                  <IconRefresh width={12} height={12} /> Reprocess
-                </button>
-              </>
+              <a className="btn sm" href={`/api/clips/${clip.id}/download`}>
+                <IconDownload width={12} height={12} /> MP4
+              </a>
+            ) : null}
+            {clip.spike_id ? (
+              <button className="btn sm" disabled={busy} onClick={onReprocess}>
+                <IconRefresh width={12} height={12} /> Re-render
+              </button>
             ) : null}
             <button
               className="btn sm danger"

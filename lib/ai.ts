@@ -15,7 +15,7 @@ import type { Env } from "./db";
 import type { SpikeFeatures } from "./spike";
 import { heuristicQuality } from "./spike";
 import { captionDirectionSuffix, withDirection } from "./direction";
-import { normaliseHint } from "./webcam";
+import { hintFromText, normaliseHint } from "./webcam";
 import type { WebcamHint } from "./webcam";
 
 export interface MomentInput {
@@ -208,8 +208,12 @@ export async function detectWebcam(
     const text = json.result?.description ?? json.result?.response ?? "";
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");
-    if (start < 0 || end <= start) return null;
-    return normaliseHint(JSON.parse(text.slice(start, end + 1)));
+    if (start < 0 || end <= start) return hintFromText(text);
+    try {
+      return normaliseHint(JSON.parse(text.slice(start, end + 1)));
+    } catch {
+      return hintFromText(text);
+    }
   } catch {
     return null;
   }

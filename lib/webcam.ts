@@ -86,6 +86,39 @@ export function parseWebcamBox(json: string | null | undefined): WebcamBox | nul
   }
 }
 
+/**
+ * Vision models do not always answer in JSON. When the reply is prose, recover
+ * the same region/size answer instead of discarding a usable detection.
+ */
+export function hintFromText(text: string): WebcamHint | null {
+  const lower = text.toLowerCase();
+  if (!/(webcam|face \s*cam|facecam|camera)/.test(lower)) return null;
+  if (/(no webcam|not visible|no face|isn't visible|is not visible)/.test(lower)) return null;
+
+  const vertical = /\b(top|upper)\b/.test(lower)
+    ? "top"
+    : /\b(mid|middle|center|centre)\b/.test(lower)
+      ? "mid"
+      : /\b(bottom|lower)\b/.test(lower)
+        ? "bottom"
+        : null;
+  const horizontal = /\bleft\b/.test(lower)
+    ? "left"
+    : /\bright\b/.test(lower)
+      ? "right"
+      : /\b(center|centre|middle)\b/.test(lower)
+        ? "center"
+        : null;
+  if (!vertical || !horizontal) return null;
+
+  const size = /\b(large|big|huge)\b/.test(lower)
+    ? "large"
+    : /\b(small|tiny|little)\b/.test(lower)
+      ? "small"
+      : "medium";
+  return normaliseHint({ webcam: true, region: `${vertical}-${horizontal}`, size });
+}
+
 export function storedWebcam(hint: WebcamHint, box: WebcamBox): string {
   return JSON.stringify({ visible: true, region: hint.region, size: hint.size, box });
 }

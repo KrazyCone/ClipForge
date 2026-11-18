@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   boxFromHint,
+  hintFromText,
   normaliseHint,
   parseWebcamBox,
   storedWebcam,
@@ -36,6 +37,16 @@ test("model output is validated, not trusted", () => {
     region: "top-right",
     size: "medium",
   });
+});
+
+test("prose answers are recovered when the model skips JSON", () => {
+  assert.deepEqual(hintFromText("The webcam is in the bottom left corner, fairly small."), {
+    visible: true,
+    region: "bottom-left",
+    size: "small",
+  });
+  assert.equal(hintFromText("No webcam visible in this frame."), null);
+  assert.equal(hintFromText("The player is in the middle of the map."), null);
 });
 
 test("stored boxes round-trip and malformed ones are rejected", () => {
