@@ -109,7 +109,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       )
       .run();
 
-    if (analysis.qualityScore < settings.minQualityScore || !analysis.interesting) {
+    // The score is the judgement; the model's separate `interesting` opinion is
+    // not consulted, because it regularly contradicts the score it just gave
+    // and silently threw away passing moments.
+    if (analysis.qualityScore < settings.minQualityScore) {
       return json({
         ok: true,
         skipped: true,
