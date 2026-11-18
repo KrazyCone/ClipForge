@@ -261,6 +261,16 @@ export function detectSpike(
   const peakRate = stats.peak;
   const ratio = (peakRate + 1) / (stats.baseline + 1);
 
+  // Busy chats cannot double: at 20-40 messages/s a real moment usually reads
+  // as a 1.6-2x burst for a few seconds. Scoring every channel against a quiet
+  // channel's 2x+ multiple is why a monitoring run could sit on five live
+  // channels for an hour and emit nothing. The z-test still has to agree, so a
+  // 20 -> 30/s wobble is not enough on its own.
+  const busy = stats.baseline >= 8;
+  const minRatio = busy ? Math.min(cfg.minRatio, 1.55) : cfg.minRatio;
+  const minZ = busy ? Math.min(cfg.minZ, 1.9) : cfg.minZ;
+  const minIntensity = busy ? Math.min(cfg.minIntensity, 52) : cfg.minIntensity;
+
   const zScore = clamp((stats.z - 2) / 12, 0, 1);
   const ratioScore = clamp(Math.log2(ratio) / 3.2, 0, 1);
   // Volume matters but is capped: a 40 msg/s burst in a huge channel should not
@@ -293,9 +303,9 @@ export function detectSpike(
   // 90 msg/s channel is not a moment). Either one alone produces false clips.
   const fires =
     counted.length >= cfg.minMessages &&
-    intensity >= cfg.minIntensity &&
-    stats.z >= cfg.minZ &&
-    ratio >= cfg.minRatio;
+    intensity >= minIntensity &&
+    stats.z >= minZ &&
+    ratio >= minRatio;
 
   if (!fires) return null;
 

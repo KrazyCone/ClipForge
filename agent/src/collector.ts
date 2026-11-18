@@ -30,12 +30,16 @@ const IDLE_EXIT_MS = 15 * 60_000;
 /** Reconnect if a live channel's chat has been silent for this long: the socket is usually dead. */
 const SILENT_SOCKET_MS = 10 * 60_000;
 const HEARTBEAT_MS = 5 * 60_000;
+/** Let a channel build a baseline before judging its chat. */
+const DETECT_WARMUP_SEC = 60;
 /** How long a run with nothing to watch waits before the next one starts. */
 const IDLE_HANDOVER_SEC = 300;
 
 interface ChannelState {
   id: string;
   login: string;
+  /** unix seconds this channel was added; detection waits for a real baseline */
+  joinedAt: number;
   displayName: string;
   messages: ChatMessage[];
   minuteStart: number;
@@ -101,6 +105,12 @@ export class Collector {
   private draining = false;
   /** Spikes that arrived while both live render slots were busy. */
   private pendingLive: { login: string; ts: number; spikeId: string }[] = [];
+  /** true while a detection pass is in flight, so slow networks cannot pile up runs */
+  private detecting = false;
+  /** unix seconds of the last moment detection actually emitted, for the heartbeat */
+  private lastDetectionAt = 0;
+  /** unix seconds of the last completed detection pass, so a stalled loop is visible */
+  private lastDetectPassAt = 0;
   private watchTimer: NodeJS.Timeout | null = null;
   private windowTimer: NodeJS.Timeout | null = null;
   private lastMessageAt = Date.now();
@@ -394,6 +404,7 @@ export class Collector {
       id: channel.id,
       login,
       displayName: channel.display_name,
+      joinedAt: Date.now() / 1000,
       messages: [],
       minuteStart: Math.floor(Date.now() / 1000 / 60) * 60,
       minuteCounts: new Array(12).fill(0),
@@ -460,9 +471,18 @@ export class Collector {
     }
 
     if (now - this.lastBeatAt >= HEARTBEAT_MS) {
+      // The last-detection age makes a dead detector visible: heartbeats alone
+      // stay healthy while no spike can be emitted at all.
+      const lastSpike = this.lastDetectionAt
+        ? `${Math.round((now - this.lastDetectionAt * 1000) / 60_000)} min ago`
+        : "never this run";
+      const lastPass = this.lastDetectPassAt
+        ? `${Math.round((now - this.lastDetectPassAt * 1000) / 60_000)} min ago`
+        : "never";
       log(
         `heartbeat: ${this.states.size} channel(s) joined, ${this.recorders.size} buffering, ` +
-          `${this.messagesSinceBeat} chat message(s) in the last ${Math.round((now - this.lastBeatAt) / 60_000)} min`,
+          `${this.messagesSinceBeat} chat message(s) in the last ${Math.round((now - this.lastBeatAt) / 60_000)} min, ` +
+          `last detector pass ${lastPass}, last spike ${lastSpike}`,
       );
       this.lastBeatAt = now;
       this.messagesSinceBeat = 0;
@@ -733,46 +753,62 @@ export class Collector {
 
   /** Runs the detector on every channel and posts qualifying events. */
   private async detectAll(): Promise<void> {
-    if (!this.settings) return;
-    const cfg = configFromSensitivity(this.settings.spikeSensitivity);
-    const now = Date.now() / 1000;
+    // One pass at a time. The interval fires every 5s; if a request stalls for
+    // its full deadline, overlapping passes would otherwise queue up behind it.
+    if (!this.settings || this.detecting || this.stopping) return;
+    this.detecting = true;
+    try {
+      const cfg = configFromSensitivity(this.settings.spikeSensitivity);
+      const now = Date.now() / 1000;
 
-    for (const state of this.states.values()) {
-      if (now - state.lastSpikeAt < cfg.cooldownSeconds) continue;
-      if (state.messages.length < cfg.minMessages) continue;
+      for (const state of this.states.values()) {
+        // With no history the baseline is 0, so the first busy second after
+        // joining looks like an intensity-100 moment and produced a clip of
+        // nothing. Give the window a minute to fill before judging it.
+        if (now - state.joinedAt < DETECT_WARMUP_SEC) continue;
+        if (now - state.lastSpikeAt < cfg.cooldownSeconds) continue;
+        if (state.messages.length < cfg.minMessages) continue;
 
-      const candidate = detectSpike(state.messages, now, cfg);
-      if (!candidate) continue;
+        const candidate = detectSpike(state.messages, now, cfg);
+        if (!candidate) continue;
 
-      state.lastSpikeAt = now;
-      const payload: SpikePayload = {
-        tsUnix: Math.round(candidate.ts),
-        messageCount: candidate.features.messageCount,
-        baselineRate: candidate.features.baselineRate,
-        peakRate: candidate.features.peakRate,
-        uniqueChatters: candidate.features.uniqueChatters,
-        intensity: candidate.intensity,
-        zScore: candidate.features.zScore,
-        features: candidate.features as unknown as Record<string, unknown>,
-        samples: candidate.samples,
-      };
+        state.lastSpikeAt = now;
+        const payload: SpikePayload = {
+          tsUnix: Math.round(candidate.ts),
+          messageCount: candidate.features.messageCount,
+          baselineRate: candidate.features.baselineRate,
+          peakRate: candidate.features.peakRate,
+          uniqueChatters: candidate.features.uniqueChatters,
+          intensity: candidate.intensity,
+          zScore: candidate.features.zScore,
+          features: candidate.features as unknown as Record<string, unknown>,
+          samples: candidate.samples,
+        };
 
-      try {
-        const result = await this.api.ingest({ login: state.login, spike: payload });
-        log(
-          `spike ${state.login} intensity=${candidate.intensity} ` +
-            `${candidate.features.baselineRate.toFixed(1)}/s -> ${candidate.features.peakRate}/s ` +
-            `(${result.merged ? "merged" : "new"} ${result.spikeId ?? ""})`,
-        );
+        try {
+          const result = await this.api.ingest({ login: state.login, spike: payload });
+          this.lastDetectionAt = now;
+          log(
+            `spike ${state.login} intensity=${candidate.intensity} ` +
+              `${candidate.features.baselineRate.toFixed(1)}/s -> ${candidate.features.peakRate}/s ` +
+              `(${result.merged ? "merged" : "new"} ${result.spikeId ?? ""})`,
+          );
 
-        // Render straight from the local ring buffer so the clip exists while
-        // the stream is still live. Falls back to the VOD renderer on failure.
-        if (result.spikeId && !result.merged) {
-          void this.captureLive(state, candidate.ts, result.spikeId);
+          // Render straight from the local ring buffer so the clip exists while
+          // the stream is still live. Falls back to the VOD renderer on failure.
+          if (result.spikeId && !result.merged) {
+            void this.captureLive(state, candidate.ts, result.spikeId);
+          }
+        } catch (err) {
+          log(`spike ingest failed for ${state.login}`, String(err));
         }
-      } catch (err) {
-        log(`spike ingest failed for ${state.login}`, String(err));
       }
+    } catch (err) {
+      // Never let one malformed burst kill the 5s detection timer.
+      log(`spike detection pass failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.lastDetectPassAt = Date.now() / 1000;
+      this.detecting = false;
     }
   }
 }

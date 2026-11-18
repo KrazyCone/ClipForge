@@ -112,10 +112,30 @@ export interface SpikePayload {
 export class ClipforgeApi {
   constructor(private cfg: AgentConfig) {}
 
-  private async request(path: string, init: RequestInit = {}): Promise<Response> {
+  /**
+   * Every call here runs from a timer (detection every 5s, drain every 3min),
+   * and `fetch` has no deadline of its own. A single request that never answers
+   * used to hang the whole loop silently: chat and the heartbeat kept running
+   * while no spike could ever be emitted again. Each call gets a deadline now.
+   */
+  private async request(
+    path: string,
+    init: RequestInit = {},
+    timeoutMs = 30_000,
+  ): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.cfg.ingestToken) headers.set("authorization", `Bearer ${this.cfg.ingestToken}`);
-    return fetch(`${this.cfg.baseUrl}${path}`, { ...init, headers });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(`${this.cfg.baseUrl}${path}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async queue(limit = 3): Promise<QueueResponse> {
@@ -128,7 +148,7 @@ export class ClipforgeApi {
   async refreshLive(): Promise<{
     channels: { id: string; login: string; display_name: string; is_live: number; capture_mode: string }[];
   }> {
-    const res = await this.request("/api/twitch/refresh", { method: "POST" });
+    const res = await this.request("/api/twitch/refresh", { method: "POST" }, 60_000);
     if (!res.ok) throw new Error(`refresh ${res.status}: ${(await res.text()).slice(0, 200)}`);
     return (await res.json()) as {
       channels: { id: string; login: string; display_name: string; is_live: number; capture_mode: string }[];
@@ -146,30 +166,44 @@ export class ClipforgeApi {
   }
 
   async setSpikeStatus(id: string, status: string): Promise<void> {
-    await this.request(`/api/spikes/${id}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status }),
-    });
+    await this.request(
+      `/api/spikes/${id}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status }),
+      },
+      20_000,
+    );
   }
 
   async failClip(id: string, error: string): Promise<void> {
-    await this.request(`/api/clips/${id}/status`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status: "failed", error }),
-    }).catch(() => {});
+    await this.request(
+      `/api/clips/${id}/status`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "failed", error }),
+      },
+      20_000,
+    ).catch(() => {});
   }
 
   async analyze(
     id: string,
     payload: { frames?: string[]; audioBase64?: string; transcript?: string },
   ): Promise<AnalyzeResult> {
-    const res = await this.request(`/api/spikes/${id}/analyze`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    // Frames + Whisper + the LLM can take a while, but a hung analysis must not
+    // hold a live render slot for the rest of the run.
+    const res = await this.request(
+      `/api/spikes/${id}/analyze`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+      180_000,
+    );
     if (!res.ok) throw new Error(`analyze ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return (await res.json()) as AnalyzeResult;
   }
@@ -187,7 +221,7 @@ export class ClipforgeApi {
       form.set("thumb", new Blob([new Uint8Array(thumb)], { type: "image/jpeg" }), "thumb.jpg");
     }
     form.set("meta", JSON.stringify(meta));
-    const res = await this.request("/api/clips/upload", { method: "POST", body: form });
+    const res = await this.request("/api/clips/upload", { method: "POST", body: form }, 240_000);
     if (!res.ok) throw new Error(`upload ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return (await res.json()) as { ok: boolean; mediaUrl?: string };
   }
