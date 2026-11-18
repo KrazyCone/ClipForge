@@ -186,7 +186,7 @@ export function ClipLibrary({
 
   async function rebuild(
     clip: Clip,
-    options: { makeLonger?: boolean; needsContext?: boolean } = {},
+    options: { makeLonger?: boolean; needsContext?: boolean; webcamRegion?: string } = {},
   ) {
     setBusy(clip.id);
     const res = await fetch(`/api/clips/${clip.id}/rebuild`, {
@@ -543,7 +543,11 @@ function ClipModal({
   onRegenerate: () => void;
   onReprocess: () => void;
   onSave: (title: string, caption: string) => void;
-  onRebuild: (options?: { makeLonger?: boolean; needsContext?: boolean }) => void;
+  onRebuild: (options?: {
+    makeLonger?: boolean;
+    needsContext?: boolean;
+    webcamRegion?: string;
+  }) => void;
   onApplySuggestion: (patch: Partial<AppSettings>) => void;
   onFeedback: (feedback: ClipFeedback | null) => void;
 }) {
@@ -551,6 +555,7 @@ function ClipModal({
   const [caption, setCaption] = useState(clip.caption ?? "");
   const [copied, setCopied] = useState(false);
   const [needsContext, setNeedsContext] = useState(false);
+  const [webcamRegion, setWebcamRegion] = useState("auto");
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -661,6 +666,34 @@ function ClipModal({
                 ? `Webcam: ${region} — enlarged above the gameplay.`
                 : `Webcam: ${region} — enlargement is switched off in Settings.`;
             })()}
+          </div>
+
+          <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <span className="faint" style={{ fontSize: 10.5 }}>
+              Webcam position
+            </span>
+            <select
+              className="select"
+              value={webcamRegion}
+              disabled={busy || Boolean(clip.rebuild_pending)}
+              onChange={(event) => setWebcamRegion(event.target.value)}
+              style={{ fontSize: 11.5, padding: "4px 6px" }}
+            >
+              <option value="auto">Auto-detect</option>
+              <option value="top-left">Top left</option>
+              <option value="top-right">Top right</option>
+              <option value="bottom-left">Bottom left</option>
+              <option value="bottom-right">Bottom right</option>
+              <option value="none">No webcam</option>
+            </select>
+            <button
+              className="btn sm"
+              disabled={webcamRegion === "auto" || busy || Boolean(clip.rebuild_pending)}
+              title="Re-cut this clip with the webcam in that corner"
+              onClick={() => onRebuild({ webcamRegion, needsContext })}
+            >
+              Apply
+            </button>
           </div>
         </div>
         </div>

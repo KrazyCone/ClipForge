@@ -16,24 +16,31 @@ export interface WebcamBox {
   h: number;
 }
 
-/** Anchor of the box within the frame, 0 = left/top, 1 = right/bottom. */
-const ANCHORS: Record<string, [number, number]> = {
-  "top-left": [0, 0],
-  "top-center": [0.5, 0],
-  "top-right": [1, 0],
-  "mid-left": [0, 0.5],
+/**
+ * Centre of each region cell. Cropping around the cell centre rather than the
+ * frame corner keeps a webcam that sits a little way in from the edge inside
+ * the crop instead of filling it with the edge of the game.
+ */
+const CELLS: Record<string, [number, number]> = {
+  "top-left": [1 / 6, 1 / 6],
+  "top-center": [0.5, 1 / 6],
+  "top-right": [5 / 6, 1 / 6],
+  "mid-left": [1 / 6, 0.5],
   "mid-center": [0.5, 0.5],
-  "mid-right": [1, 0.5],
-  "bottom-left": [0, 1],
-  "bottom-center": [0.5, 1],
-  "bottom-right": [1, 1],
+  "mid-right": [5 / 6, 0.5],
+  "bottom-left": [1 / 6, 5 / 6],
+  "bottom-center": [0.5, 5 / 6],
+  "bottom-right": [5 / 6, 5 / 6],
 };
 
 const WIDTHS: Record<string, number> = {
   small: 0.2,
-  medium: 0.28,
-  large: 0.36,
+  medium: 0.26,
+  large: 0.32,
 };
+
+/** Regions the renderer accepts, for a manual override in the UI. */
+export const WEBCAM_REGIONS = Object.keys(CELLS);
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const round = (v: number) => Math.round(v * 10_000) / 10_000;
@@ -45,7 +52,11 @@ export function normaliseHint(raw: unknown): WebcamHint | null {
   const visible = value.webcam ?? value.visible;
   if (visible !== true) return null;
   const region = String(value.region ?? "").toLowerCase();
-  if (!(region in ANCHORS)) return null;
+  if (!(region in CELLS)) return null;
+  // A confident-sounding guess is not a detection; below 55 we keep the normal
+  // layout rather than crop a random corner.
+  const confidence = Number(value.confidence);
+  if (Number.isFinite(confidence) && confidence < 55) return null;
   const size = String(value.size ?? "medium").toLowerCase();
   return { visible: true, region, size: size in WIDTHS ? size : "medium" };
 }
@@ -53,15 +64,15 @@ export function normaliseHint(raw: unknown): WebcamHint | null {
 /** Turns a region/size hint into a normalized crop box, always inside the frame. */
 export function boxFromHint(hint: WebcamHint | null): WebcamBox | null {
   if (!hint?.visible) return null;
-  const anchor = ANCHORS[hint.region];
-  if (!anchor) return null;
+  const centre = CELLS[hint.region];
+  if (!centre) return null;
 
   const w = WIDTHS[hint.size] ?? WIDTHS.medium;
   // A face cam is roughly 4:3. Normalized height therefore needs the 16:9
   // frame aspect folded in, or the crop comes out as a letterbox strip.
   const h = Math.min(0.9, w * (16 / 9) * 0.75);
-  const x = clamp(anchor[0] * (1 - w), 0, 1 - w);
-  const y = clamp(anchor[1] * (1 - h), 0, 1 - h);
+  const x = clamp(centre[0] - w / 2, 0, 1 - w);
+  const y = clamp(centre[1] - h / 2, 0, 1 - h);
   return { x: round(x), y: round(y), w: round(w), h: round(h) };
 }
 

@@ -326,9 +326,10 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
  * file covers the joined timeline.
  */
 /**
- * Face-forward layout: the webcam crop fills a 1080x860 band at the top and the
- * whole gameplay frame sits below it over a blurred fill, so the face is much
- * larger without losing the play. Subtitles burn over the gameplay half.
+ * Face-forward layout: the webcam crop fills a 1080x600 band at the top and the
+ * whole gameplay frame sits below it over a blurred fill. The band is sized so
+ * the face is clearly bigger than in the full-frame layout without shrinking
+ * the gameplay more than necessary; subtitles burn over the gameplay half.
  */
 function webcamChains(
   source: string,
@@ -340,11 +341,11 @@ function webcamChains(
   return [
     `[${source}]fps=30,split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
     `[wcFaceSrc]crop=iw*${f(box.w)}:ih*${f(box.h)}:iw*${f(box.x)}:ih*${f(box.y)},` +
-      `scale=1080:860:force_original_aspect_ratio=increase,crop=1080:860,setsar=1[wcFace]`,
-    `[wcGameSrc]scale=1080:1060:force_original_aspect_ratio=decrease[wcGameFit]`,
-    `[wcBgSrc]scale=1080:1060:force_original_aspect_ratio=increase,crop=1080:1060,gblur=sigma=26[wcGameBg]`,
+      `scale=1080:600:force_original_aspect_ratio=increase,crop=1080:600,setsar=1[wcFace]`,
+    `[wcGameSrc]scale=1080:1320:force_original_aspect_ratio=decrease[wcGameFit]`,
+    `[wcBgSrc]scale=1080:1320:force_original_aspect_ratio=increase,crop=1080:1320,gblur=sigma=26[wcGameBg]`,
     `[wcGameBg][wcGameFit]overlay=(W-w)/2:(H-h)/2[wcGame]`,
-    `[wcGame]pad=1080:1920:0:860:black[wcPadded]`,
+    `[wcGame]pad=1080:1920:0:600:black[wcPadded]`,
     `[wcPadded][wcFace]overlay=0:0${assPath ? `,${assFilter(assPath)}` : ""}[${outLabel}]`,
   ];
 }

@@ -202,12 +202,13 @@ export async function detectWebcam(
   try {
     const json = (await runModel(e, model, {
       prompt:
-        "You inspect one frame of a Twitch stream. Is a real streamer webcam visible: a person's face in a small overlay, usually in a corner, separate from the game? " +
-        'Reply with JSON only, no prose: {"webcam":true,"region":"top-left|top-center|top-right|mid-left|mid-center|mid-right|bottom-left|bottom-center|bottom-right","size":"small|medium|large"}. ' +
-        "Use the region where the webcam overlay sits in the frame and its rough size. If there is no person's webcam, reply {\"webcam\":false}. " +
+        "You inspect one frame of a Twitch stream. Find the streamer's webcam overlay: a separate rectangle showing a real person's face, usually in one corner and often with a border. " +
+        "It is NOT the game, a minimap, a kill feed, a scoreboard, a HUD, an in-game character, a portrait or a logo. If the only face is part of the game, there is no webcam. " +
+        'Reply with JSON only, no prose: {"webcam":true,"region":"top-left|top-center|top-right|mid-left|mid-center|mid-right|bottom-left|bottom-center|bottom-right","size":"small|medium|large","confidence":0-100}. ' +
+        "Use the region where the webcam overlay sits and its rough size. If you cannot clearly see a real webcam, reply {\"webcam\":false}. " +
         context,
       image: jpegBase64,
-      max_tokens: 80,
+      max_tokens: 100,
     })) as { result?: { description?: string; response?: string } };
     const text = json.result?.description ?? json.result?.response ?? "";
     const start = text.indexOf("{");

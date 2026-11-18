@@ -11,7 +11,8 @@ import {
 test("a bottom-left face cam maps inside the frame", () => {
   const box = boxFromHint({ visible: true, region: "bottom-left", size: "medium" });
   assert.ok(box);
-  assert.equal(box!.x, 0);
+  // Centred in the bottom-left cell, so the box starts just inside the frame.
+  assert.ok(box!.x >= 0 && box!.x < 0.1);
   assert.ok(box!.w > 0.2 && box!.w < 0.4);
   assert.ok(box!.y + box!.h <= 1.0001);
 });
@@ -21,6 +22,9 @@ test("a large bottom-right cam stays inside the frame", () => {
   assert.ok(box);
   assert.ok(box!.x >= 0 && box!.x + box!.w <= 1.0001);
   assert.ok(box!.y >= 0 && box!.y + box!.h <= 1.0001);
+  // It should sit in the bottom-right area, not span the whole frame.
+  assert.ok(box!.x > 0.6 && box!.y > 0.55);
+  assert.ok(box!.w < 0.4 && box!.h < 0.5);
 });
 
 test("no webcam or an unknown region yields no crop", () => {
@@ -37,6 +41,11 @@ test("model output is validated, not trusted", () => {
     region: "top-right",
     size: "medium",
   });
+  // A guess the model itself is unsure about must not crop a random corner.
+  assert.equal(
+    normaliseHint({ webcam: true, region: "bottom-left", size: "medium", confidence: 30 }),
+    null,
+  );
 });
 
 test("prose answers are recovered when the model skips JSON", () => {

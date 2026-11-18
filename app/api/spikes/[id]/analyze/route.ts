@@ -7,7 +7,7 @@ import {
   loudnessContrast,
   transcribe,
 } from "@/lib/ai";
-import { boxFromHint, storedWebcam } from "@/lib/webcam";
+import { boxFromHint, storedWebcam, type WebcamHint } from "@/lib/webcam";
 import { pollSignals } from "@/lib/poll";
 import { uniqueTitle } from "@/lib/titles";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
@@ -59,6 +59,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       minQualityScore?: number;
       longer?: boolean;
       needsContext?: boolean;
+      webcamRegion?: string;
     } = {};
     try {
       override = JSON.parse(spike.analyze_json ?? "{}") as typeof override;
@@ -138,12 +139,27 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     // One extra vision call per clip. If the model is unsure, the clip keeps
     // the normal layout rather than guessing a crop.
     let webcamJson: string | null = null;
-    if (settings.webcamFocus && frames.length > 0) {
-      const hint = await detectWebcam(
-        e,
-        frames[0],
-        `Game: ${channel?.game_name ?? "unknown"}. Channel: ${channel?.display_name ?? spike.channel_login}.`,
-      );
+    const manualRegion =
+      typeof override.webcamRegion === "string" ? override.webcamRegion : "";
+    const manualHint: WebcamHint | null =
+      manualRegion && manualRegion !== "none"
+        ? { visible: true, region: manualRegion, size: "medium" }
+        : null;
+    const manualBox = boxFromHint(manualHint);
+
+    if (manualRegion === "none") {
+      // The streamer has no face cam, or the operator never wants one here.
+      webcamJson = null;
+    } else if (manualHint && manualBox) {
+      webcamJson = storedWebcam(manualHint, manualBox);
+    } else if (settings.webcamFocus && frames.length > 0) {
+      const context = `Game: ${channel?.game_name ?? "unknown"}. Channel: ${channel?.display_name ?? spike.channel_login}.`;
+      // A late frame gives the model a second chance when the first is a
+      // fullscreen scene that happens to hide the cam.
+      let hint = await detectWebcam(e, frames[0], context);
+      if (!hint && frames.length > 1) {
+        hint = await detectWebcam(e, frames[frames.length - 1], context);
+      }
       const box = boxFromHint(hint);
       if (hint && box) webcamJson = storedWebcam(hint, box);
     }

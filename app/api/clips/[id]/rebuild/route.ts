@@ -3,6 +3,7 @@ import { json, readJson } from "@/lib/api";
 import { denied } from "@/lib/guard";
 import { getAllFeedback } from "@/lib/queries";
 import { summariseFeedback } from "@/lib/feedback";
+import { WEBCAM_REGIONS } from "@/lib/webcam";
 import type { Clip } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -17,6 +18,8 @@ interface RebuildBody {
   makeLonger?: boolean;
   /** include the setup around the moment, not only the payoff */
   needsContext?: boolean;
+  /** force a corner when auto-detection picked the wrong one, or "none" */
+  webcamRegion?: string;
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -50,6 +53,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       patch.longer = true;
     }
     if (body.needsContext) patch.needsContext = true;
+    if (
+      typeof body.webcamRegion === "string" &&
+      (body.webcamRegion === "none" || WEBCAM_REGIONS.includes(body.webcamRegion))
+    ) {
+      patch.webcamRegion = body.webcamRegion;
+    }
 
     await ensureAnalyzeColumn(d);
     await d
