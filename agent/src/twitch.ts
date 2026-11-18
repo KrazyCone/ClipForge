@@ -12,6 +12,27 @@ const HELIX = "https://api.twitch.tv/helix";
 const GQL = "https://gql.twitch.tv/gql";
 // Public web client id, used for the playback access token the VOD page itself requests.
 const WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+// usher/CDN reject requests that do not look like a browser player.
+const PLAYER_HEADERS = {
+  "Client-Id": WEB_CLIENT_ID,
+  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  Origin: "https://www.twitch.tv",
+  Referer: "https://www.twitch.tv/",
+} as const;
+
+/**
+ * usher's playback authorisation moved from `nauth`/`nauthsig` to `token`/`sig`.
+ * The retired pair is rejected with an empty 403 from CloudFront, which is why
+ * a valid token could still fail to open a stream.
+ */
+function usherQuery(token: { value: string; signature: string }): string {
+  return (
+    `allow_source=true&allow_audio_only=true&supported_codecs=avc1` +
+    `&token=${encodeURIComponent(token.value)}&sig=${encodeURIComponent(token.signature)}` +
+    `&platform=web&player_backend=mediaplayer&playlist_include_framerate=true` +
+    `&reassignments_supported=true&p=${Math.floor(Math.random() * 9e6)}`
+  );
+}
 
 export interface TwitchVideo {
   id: string;
@@ -138,12 +159,9 @@ export class TwitchVod {
     if (!token) throw new Error("no live playback token - is the channel live?");
 
     const master =
-      `https://usher.ttvnw.net/api/channel/hls/${login.toLowerCase()}.m3u8` +
-      `?allow_source=true&allow_audio_only=true&supported_codecs=h264` +
-      `&nauth=${encodeURIComponent(token.value)}&nauthsig=${token.signature}` +
-      `&player=twitchweb&p=${Math.floor(Math.random() * 9e6)}`;
+      `https://usher.ttvnw.net/api/channel/hls/${login.toLowerCase()}.m3u8?` + usherQuery(token);
 
-    const mres = await fetch(master);
+    const mres = await fetch(master, { headers: PLAYER_HEADERS });
     if (!mres.ok) throw new Error(`live usher ${mres.status}`);
     return this.pickVariant(await mres.text());
   }
@@ -171,11 +189,9 @@ export class TwitchVod {
     const token = json.data?.videoPlaybackAccessToken;
     if (!token) throw new Error("no playback token - the VOD may be restricted or deleted");
 
-    const master = `https://usher.ttvnw.net/vod/${vodId}.m3u8?allow_source=true&allow_audio_only=true` +
-      `&nauth=${encodeURIComponent(token.value)}&nauthsig=${token.signature}` +
-      `&player=twitchweb&supported_codecs=h264&p=${Math.floor(Math.random() * 9e6)}`;
+    const master = `https://usher.ttvnw.net/vod/${vodId}.m3u8?` + usherQuery(token);
 
-    const mres = await fetch(master);
+    const mres = await fetch(master, { headers: PLAYER_HEADERS });
     if (!mres.ok) throw new Error(`usher ${mres.status}`);
     return this.pickVariant(await mres.text());
   }
