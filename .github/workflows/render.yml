@@ -1,0 +1,49 @@
+# Fallback renderer. The collector now cuts live clips from its ring buffer, so
+# this job exists to rescue moments the live path missed:
+#   - spikes detected between collector runs,
+#   - live capture failures,
+#   - clips whose render was abandoned.
+# It uses the broadcaster's archive VOD, so it can also produce clips for a
+# stream that has already ended.
+
+name: ClipForge renderer (VOD fallback)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: clipforge-renderer
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Install agent dependencies
+        run: cd agent && npm install --no-audit --no-fund
+
+      - name: Build agent
+        run: cd agent && npm run build
+
+      - name: Render queued clips
+        working-directory: agent
+        env:
+          CLIPFORGE_BASE_URL: ${{ secrets.CLIPFORGE_BASE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+        run: node dist/agent/src/renderer.js
