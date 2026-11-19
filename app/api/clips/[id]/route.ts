@@ -1,4 +1,4 @@
-import { db, files } from "@/lib/db";
+import { db, ensureClipStateColumns, files } from "@/lib/db";
 import { nudgeRenderer } from "@/lib/workflow";
 import { json, readJson } from "@/lib/api";
 import type { Clip } from "@/lib/types";
@@ -31,11 +31,15 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       } catch {
         /* asset may not exist */
       }
+      await ensureClipStateColumns(d);
+      const now = new Date().toISOString();
       await d
         .prepare(
-          "UPDATE clips SET status = 'pending', r2_key = NULL, thumb_key = NULL, bytes = NULL, error = NULL, updated_at = ? WHERE id = ?",
+          // The coming file is a new cut, so it counts as recently re-cut and has
+          // not been watched yet.
+          "UPDATE clips SET status = 'pending', r2_key = NULL, thumb_key = NULL, bytes = NULL, error = NULL, recut_at = ?, watched_at = NULL, updated_at = ? WHERE id = ?",
         )
-        .bind(new Date().toISOString(), id)
+        .bind(now, now, id)
         .run();
       if (clip.spike_id) {
         await d.prepare("UPDATE spikes SET status = 'rendering' WHERE id = ?").bind(clip.spike_id).run();

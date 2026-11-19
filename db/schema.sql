@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS clips (
   end_offset    REAL,
   transcript    TEXT,
   webcam_json   TEXT,                   -- detected face-cam crop for the layout
+  recut_at      TEXT,                   -- when this clip was last re-cut
+  watched_at    TEXT,                   -- cleared the "ready" badge once opened
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );

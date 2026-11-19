@@ -31,6 +31,7 @@ const SORTS = [
   { key: "funnest", label: "Funniest" },
   { key: "intensity", label: "Chat intensity" },
   { key: "duration", label: "Duration" },
+  { key: "recut", label: "Recently re-cut" },
   { key: "streamer", label: "Streamer" },
   { key: "game", label: "Game" },
 ];
@@ -68,8 +69,11 @@ export function ClipLibrary({
   );
 
   const load = useCallback(
-    async (nextSort: string) => {
-      const res = await fetch(`/api/clips?sort=${SORT_MAP[nextSort] ?? nextSort}&limit=120`);
+    async (nextSort: string, nextFilter = "all") => {
+      // The re-cut view is answered by the server, so it cannot miss re-cuts
+      // that fell outside the newest page.
+      const recut = nextFilter === "recut" ? "&recut=1" : "";
+      const res = await fetch(`/api/clips?sort=${SORT_MAP[nextSort] ?? nextSort}&limit=120${recut}`);
       const data = (await res.json()) as { clips: Clip[] };
       setClips(data.clips ?? []);
     },
@@ -88,10 +92,10 @@ export function ClipLibrary({
   useEffect(() => {
     if (!rebuilding) return;
     const t = setInterval(() => {
-      void load(sort === "taste" ? "newest" : sort);
+      void load(sort === "taste" ? "newest" : sort, filter);
     }, 60_000);
     return () => clearInterval(t);
-  }, [rebuilding, sort, load]);
+  }, [rebuilding, sort, filter, load]);
 
   // Keep an open modal in step with refreshed clip data (queued re-cut, new render).
   useEffect(() => {
@@ -110,13 +114,36 @@ export function ClipLibrary({
   async function changeSort(value: string) {
     setSort(value);
     // "Your feedback" ranks the clips already loaded, so it needs no round trip.
-    if (value !== "taste") await load(value);
+    if (value !== "taste") await load(value, filter);
+  }
+
+  async function changeFilter(value: string) {
+    setFilter(value);
+    // Entering or leaving the re-cut view changes which clips the server sends;
+    // every other filter is applied to the loaded list.
+    if (value === "recut" || filter === "recut") {
+      await load(sort === "taste" ? "newest" : sort, value);
+    }
+  }
+
+  // Opening a clip counts as watching it, and that is what clears its ready
+  // badge. The card behind the modal updates straight away.
+  async function openClip(clip: Clip) {
+    setOpen(clip);
+    if (clip.watched_at) return;
+    const stamp = new Date().toISOString();
+    setClips((prev) =>
+      prev.map((c) => (c.id === clip.id && !c.watched_at ? { ...c, watched_at: stamp } : c)),
+    );
+    await fetch(`/api/clips/${clip.id}/watched`, { method: "POST" }).catch(() => {});
   }
 
   const summary = useMemo(
     () => summariseFeedback(Object.values(feedback), current),
     [feedback, current],
   );
+
+  const recutCount = useMemo(() => clips.filter((c) => c.recut_at).length, [clips]);
 
   const counts = useMemo(
     () => ({
@@ -134,6 +161,7 @@ export function ClipLibrary({
     if (filter === "processing")
       out = out.filter((c) => c.status === "pending" || c.status === "rendering");
     if (filter === "failed") out = out.filter((c) => c.status === "failed");
+    if (filter === "recut") out = out.filter((c) => c.recut_at);
     if (filter.startsWith("ch:")) out = out.filter((c) => c.channel_login === filter.slice(3));
     if (filter.startsWith("game:")) out = out.filter((c) => c.game_name === filter.slice(5));
 
@@ -214,7 +242,7 @@ export function ClipLibrary({
           ? "Queued — a longer re-cut is on its way"
           : "Queued — the re-cut starts on the next renderer pass",
       );
-      await load(sort === "taste" ? "newest" : sort);
+      await load(sort === "taste" ? "newest" : sort, filter);
     } else {
       setToast(data.error ?? "Could not queue the rebuild");
     }
@@ -363,13 +391,14 @@ export function ClipLibrary({
           {[
             { key: "all", label: `All ${clips.length}` },
             { key: "ready", label: "Ready" },
+            { key: "recut", label: `Re-cut ${recutCount}` },
             { key: "processing", label: "Processing" },
             { key: "failed", label: "Failed" },
           ].map((f) => (
             <button
               key={f.key}
               className={`btn sm ${filter === f.key ? "primary" : "ghost"}`}
-              onClick={() => setFilter(f.key)}
+              onClick={() => void changeFilter(f.key)}
             >
               {f.label}
             </button>
@@ -426,7 +455,7 @@ export function ClipLibrary({
             const reaction = feedback[clip.id];
             return (
               <article key={clip.id} className="clip-card">
-                <div className="clip-thumb" onClick={() => setOpen(clip)}>
+                <div className="clip-thumb" onClick={() => openClip(clip)}>
                   {clip.thumb_key ? (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img src={`/api/media/${clip.thumb_key}`} alt={clip.caption ?? ""} loading="lazy" />
@@ -436,17 +465,21 @@ export function ClipLibrary({
                     </div>
                   )}
                   <div className="clip-thumb-top">
-                    <Badge
-                      tone={
-                        clip.status === "ready"
-                          ? "neutral"
-                          : clip.status === "failed"
-                            ? "red"
-                            : "amber"
-                      }
-                    >
-                      {clip.status}
-                    </Badge>
+                    {/* A watched clip drops its "ready" badge so the cards that
+                        are still waiting to be watched stand out. */}
+                    {clip.status === "ready" && clip.watched_at ? null : (
+                      <Badge
+                        tone={
+                          clip.status === "ready"
+                            ? "neutral"
+                            : clip.status === "failed"
+                              ? "red"
+                              : "amber"
+                        }
+                      >
+                        {clip.status}
+                      </Badge>
+                    )}
                     {clip.quality_score !== null ? (
                       <span
                         className="badge"
@@ -475,7 +508,7 @@ export function ClipLibrary({
                     {clip.rebuild_pending ? <Badge tone="amber">re-cut queued</Badge> : null}
                   </div>
                   <div className="clip-actions">
-                    <button className="btn sm ghost icon" title="Play" onClick={() => setOpen(clip)}>
+                    <button className="btn sm ghost icon" title="Play" onClick={() => openClip(clip)}>
                       <IconPlay width={12} height={12} />
                     </button>
                     {clip.status === "ready" ? (

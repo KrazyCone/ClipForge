@@ -1,4 +1,4 @@
-import { db, ensureAnalyzeColumn } from "@/lib/db";
+import { db, ensureAnalyzeColumn, ensureClipStateColumns } from "@/lib/db";
 import { json } from "@/lib/api";
 import type { Clip } from "@/lib/types";
 import { denied } from "@/lib/guard";
@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 
 const SORTS: Record<string, string> = {
   newest: "c.created_at DESC",
+  recut: "c.recut_at DESC NULLS LAST, c.created_at DESC",
   quality: "c.quality_score DESC NULLS LAST, c.created_at DESC",
   funniest: "c.funniness DESC NULLS LAST, c.created_at DESC",
   intensity: "c.intensity DESC NULLS LAST, c.created_at DESC",
@@ -25,6 +26,7 @@ export async function GET(req: Request) {
   const status = url.searchParams.get("status");
   const channel = url.searchParams.get("channel");
   const spike = url.searchParams.get("spike");
+  const recut = url.searchParams.get("recut");
 
   const where: string[] = [];
   const params: unknown[] = [];
@@ -40,10 +42,14 @@ export async function GET(req: Request) {
     where.push("c.spike_id = ?");
     params.push(spike);
   }
+  if (recut === "1" || recut === "true") {
+    where.push("c.recut_at IS NOT NULL");
+  }
 
   try {
     const d = await db();
     await ensureAnalyzeColumn(d);
+    await ensureClipStateColumns(d);
     // Older clips could share a generated title; name the later ones once.
     await ensureUniqueClipTitles();
     // rebuild_pending is derived from the source moment's one-off settings, so

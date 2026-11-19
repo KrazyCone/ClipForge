@@ -89,6 +89,27 @@ export function ensureWebcamColumn(d: D1Database): Promise<void> {
   return webcamColumn;
 }
 
+let clipStateColumns: Promise<void> | null = null;
+
+/**
+ * `recut_at` and `watched_at` ship in db/schema.sql; a live database needs the
+ * ALTERs. Each one is attempted on its own so a column that already exists
+ * cannot block the other.
+ */
+export function ensureClipStateColumns(d: D1Database): Promise<void> {
+  if (!clipStateColumns) {
+    clipStateColumns = (async () => {
+      for (const sql of [
+        "ALTER TABLE clips ADD COLUMN recut_at TEXT",
+        "ALTER TABLE clips ADD COLUMN watched_at TEXT",
+      ]) {
+        await d.prepare(sql).run().catch(() => undefined);
+      }
+    })();
+  }
+  return clipStateColumns;
+}
+
 let analyzeColumn: Promise<void> | null = null;
 
 /**

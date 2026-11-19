@@ -1,4 +1,4 @@
-import { db, ensureWebcamColumn, env, getSettings } from "@/lib/db";
+import { db, ensureClipStateColumns, ensureWebcamColumn, env, getSettings } from "@/lib/db";
 import {
   analyzeMoment,
   captionsForBeats,
@@ -48,6 +48,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     const e = await env();
     const settings = await getSettings();
     await ensureWebcamColumn(d);
+    await ensureClipStateColumns(d);
 
     const spike = await d.prepare("SELECT * FROM spikes WHERE id = ?").bind(id).first<Spike>();
     if (!spike) return json({ error: "spike not found" }, 404);
@@ -461,6 +462,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
              quality_score = ?, funniness = ?, category = ?, duration_ms = ?, width = ?, height = ?,
              provider = ?, model = ?, start_offset = ?, end_offset = ?, transcript = ?,
              webcam_json = ?,
+             -- The new cut is a different video: it counts as recently re-cut and
+             -- has not been watched yet, so its ready badge comes back.
+             recut_at = ?, watched_at = NULL,
              status = 'pending', error = NULL, r2_key = NULL, thumb_key = NULL, bytes = NULL,
              updated_at = ?
            WHERE id = ?`,
@@ -482,6 +486,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           endOffset,
           transcript || null,
           webcamJson,
+          now,
           now,
           existing.id,
         )

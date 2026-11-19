@@ -87,6 +87,10 @@ export interface Clip {
   transcript: string | null;
   /** detected webcam crop, `{ visible, region, size, box }` */
   webcam_json: string | null;
+  /** when this clip was last re-cut, null if it is the first cut */
+  recut_at?: string | null;
+  /** set when the clip was opened; clears the "ready" badge on the card */
+  watched_at?: string | null;
   /** derived: the source moment is queued for a one-off re-cut */
   rebuild_pending?: number | null;
   created_at: string;
