@@ -63,6 +63,12 @@ export async function POST(req: Request) {
     // Retention: the live graph only needs recent history, and D1 storage is 100 MB.
     const cutoff = Math.floor(Date.now() / 1000) - 26 * 3600;
     statements.push(d.prepare("DELETE FROM chat_minutes WHERE ts_minute < ?").bind(cutoff));
+    // The collector now writes a run row on every heartbeat, so old ones go too.
+    statements.push(
+      d
+        .prepare("DELETE FROM runs WHERE started_at < ?")
+        .bind(new Date(Date.now() - 7 * 86_400_000).toISOString()),
+    );
 
     await d.batch(statements);
 

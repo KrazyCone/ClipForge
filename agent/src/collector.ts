@@ -533,6 +533,16 @@ export class Collector {
           `last detector pass ${lastPass}, last spike ${lastSpike}` +
           (unconfirmed.length ? `, join unconfirmed for ${unconfirmed.join(",")}` : ""),
       );
+      // Recorded, not just logged: the dashboard reads the newest run row, so a
+      // heartbeat keeps "collector" honest while a long run is still going and
+      // names the channels it is actually listening to.
+      await this.api.recordRun(
+        "collector",
+        "running",
+        `watching ${[...this.states.keys()].join(",")}` +
+          (unconfirmed.length ? `; join unconfirmed: ${unconfirmed.join(",")}` : "") +
+          `; ${this.messagesSinceBeat} msg in ${Math.round((now - this.lastBeatAt) / 60_000)} min`,
+      );
       this.lastBeatAt = now;
       this.messagesSinceBeat = 0;
     }

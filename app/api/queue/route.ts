@@ -42,8 +42,12 @@ export async function GET(req: Request) {
         .all<Clip>(),
     ]);
 
+    // Ordered so the collector's startup cap keeps the channels that matter:
+    // an unordered list meant which channels got dropped was arbitrary.
     const channels = await d
-      .prepare("SELECT * FROM channels WHERE monitor = 1")
+      .prepare(
+        "SELECT * FROM channels WHERE monitor = 1 ORDER BY is_live DESC, viewer_count DESC, login ASC",
+      )
       .all<Channel>();
 
     return json({

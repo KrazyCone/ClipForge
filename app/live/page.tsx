@@ -95,6 +95,11 @@ export default async function LivePage() {
                       {c.display_name}
                     </span>
                     {c.is_live ? <Badge tone="live" dot>live</Badge> : <Badge>offline</Badge>}
+                    {/* A live channel with no chat rows at all is not a quiet
+                        chat, it is a channel the collector is not receiving. */}
+                    {c.is_live && (!chat || Date.now() / 1000 - chat.ts > 600) ? (
+                      <Badge tone="amber">no chat</Badge>
+                    ) : null}
                   </div>
                   <div className="faint truncate" style={{ fontSize: 11 }}>
                     {c.game_name ?? "No category"}
