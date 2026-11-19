@@ -60,6 +60,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       longer?: boolean;
       needsContext?: boolean;
       webcamRegion?: string;
+      title?: string;
+      caption?: string;
+      direction?: string;
     } = {};
     try {
       override = JSON.parse(spike.analyze_json ?? "{}") as typeof override;
@@ -205,6 +208,22 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .filter((v) => Number.isFinite(v));
     const maxClipSec = Math.max(8, Math.min(60, effectiveDuration + extraSec));
 
+    // A per-clip re-cut can carry the operator's own words and copy. The typed
+    // direction goes first so a long standing direction cannot truncate it.
+    const typedDirection = typeof override.direction === "string" ? override.direction.trim() : "";
+    const keptTitle = typeof override.title === "string" ? override.title.trim().slice(0, 120) : "";
+    const keptCaption =
+      typeof override.caption === "string" ? override.caption.trim().slice(0, 120) : "";
+    const copyGuidance = [
+      keptTitle ? `The operator already wrote the title: "${keptTitle}". Do not contradict it.` : "",
+      keptCaption ? `The operator already wrote the caption: "${keptCaption}". Do not contradict it.` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const direction = [typedDirection, copyGuidance, settings.clipDirection]
+      .filter(Boolean)
+      .join(" ");
+
     const input: MomentInput = {
       channelName: channel?.display_name ?? spike.channel_login,
       gameName: channel?.game_name ?? null,
@@ -219,7 +238,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       loudnessBucketSec,
       transcriptSegments: segments,
       maxClipSec,
-      direction: settings.clipDirection,
+      direction,
       pollHint: poll.likely ? poll.reason : undefined,
       contextHint: needsContext,
       avoidTitles: takenTitles.slice(0, 40),
@@ -351,6 +370,18 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       `${analysis.caption} — ${channel?.game_name ?? analysis.category}`.slice(0, 90).toUpperCase(),
       `${analysis.caption} — ${channel?.display_name ?? spike.channel_login}`.slice(0, 90).toUpperCase(),
     ]);
+    // Copy the operator typed in the modal wins over the model's, still checked
+    // for uniqueness so a hand-written title cannot collide with another clip.
+    if (keptTitle) {
+      analysis.title = uniqueTitle(keptTitle, takenTitles, [
+        `${keptTitle} — ${channel?.game_name ?? analysis.category}`,
+      ]);
+    }
+    if (keptCaption) {
+      analysis.caption = uniqueCaption(keptCaption, takenCaptions, analysis.title, [
+        `${keptCaption} — ${channel?.game_name ?? analysis.category}`.slice(0, 90).toUpperCase(),
+      ]);
+    }
 
     const assembledSec = beats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0);
     analysis.beginsAtSec = beats[0].startSec;

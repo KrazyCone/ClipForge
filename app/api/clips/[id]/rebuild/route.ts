@@ -2,7 +2,7 @@ import { db, ensureAnalyzeColumn, getSettings } from "@/lib/db";
 import { json, readJson } from "@/lib/api";
 import { denied } from "@/lib/guard";
 import { getAllFeedback } from "@/lib/queries";
-import { summariseFeedback } from "@/lib/feedback";
+import { parseReasons, REASON_LABEL, summariseFeedback } from "@/lib/feedback";
 import { WEBCAM_REGIONS } from "@/lib/webcam";
 import { nudgeRenderer } from "@/lib/workflow";
 import type { Clip } from "@/lib/types";
@@ -21,6 +21,11 @@ interface RebuildBody {
   needsContext?: boolean;
   /** force a corner when auto-detection picked the wrong one, or "none" */
   webcamRegion?: string;
+  /** copy typed in the clip modal, kept on the re-cut */
+  title?: string;
+  caption?: string;
+  /** what the operator wants changed about this cut, in their words */
+  direction?: string;
 }
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
@@ -60,6 +65,29 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     ) {
       patch.webcamRegion = body.webcamRegion;
     }
+
+    // Copy the operator typed into the modal survives the re-cut instead of
+    // being overwritten by whatever the model writes next.
+    if (typeof body.title === "string" && body.title.trim()) {
+      patch.title = body.title.trim().slice(0, 120);
+    }
+    if (typeof body.caption === "string" && body.caption.trim()) {
+      patch.caption = body.caption.trim().slice(0, 120);
+    }
+
+    // What the operator wrote is instruction, not just telemetry. The re-cut
+    // box wins when it was used; otherwise the note saved under "Your take"
+    // is what they already told us about this clip.
+    const saved = feedback.find((row) => row.clip_id === id);
+    const typed = typeof body.direction === "string" ? body.direction.trim() : (saved?.note ?? "").trim();
+    const reasons = parseReasons(saved?.reasons_json).map((slug) => REASON_LABEL[slug] ?? slug);
+    const direction = [
+      typed.slice(0, 600),
+      reasons.length ? `Their reaction to the previous cut: ${reasons.join(", ")}.` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (direction) patch.direction = direction;
 
     await ensureAnalyzeColumn(d);
     await d

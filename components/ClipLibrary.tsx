@@ -7,7 +7,6 @@ import {
   IconDownload,
   IconFilm,
   IconPlay,
-  IconPlus,
   IconRefresh,
   IconSparkle,
   IconThumbDown,
@@ -186,7 +185,14 @@ export function ClipLibrary({
 
   async function rebuild(
     clip: Clip,
-    options: { makeLonger?: boolean; needsContext?: boolean; webcamRegion?: string } = {},
+    options: {
+      makeLonger?: boolean;
+      needsContext?: boolean;
+      webcamRegion?: string;
+      title?: string;
+      caption?: string;
+      direction?: string;
+    } = {},
   ) {
     setBusy(clip.id);
     const res = await fetch(`/api/clips/${clip.id}/rebuild`, {
@@ -206,9 +212,7 @@ export function ClipLibrary({
       setToast(
         options.makeLonger
           ? "Queued — a longer re-cut is on its way"
-          : options.needsContext
-            ? "Queued — the re-cut will include the setup"
-            : "Queued — the re-cut starts on the next renderer pass",
+          : "Queued — the re-cut starts on the next renderer pass",
       );
       await load(sort === "taste" ? "newest" : sort);
     } else {
@@ -551,10 +555,13 @@ function ClipModal({
   onRegenerate: () => void;
   onReprocess: () => void;
   onSave: (title: string, caption: string) => void;
-  onRebuild: (options?: {
+  onRebuild: (options: {
     makeLonger?: boolean;
     needsContext?: boolean;
     webcamRegion?: string;
+    title?: string;
+    caption?: string;
+    direction?: string;
   }) => void;
   onApplySuggestion: (patch: Partial<AppSettings>) => void;
   onFeedback: (feedback: ClipFeedback | null) => void;
@@ -568,8 +575,17 @@ function ClipModal({
     setTitle(clip.title ?? "");
     setCaption(clip.caption ?? "");
   }, [clip.id, clip.title, clip.caption]);
+  const [makeLonger, setMakeLonger] = useState(false);
   const [needsContext, setNeedsContext] = useState(false);
   const [webcamRegion, setWebcamRegion] = useState("auto");
+  // Starts from the note written under "Your take" so the same words reach the
+  // analyser, and stays editable for this cut only.
+  const [direction, setDirection] = useState(feedback?.note ?? "");
+  useEffect(() => {
+    // Only fills an empty box: never overwrites what is being typed here.
+    if (!direction && feedback?.note) setDirection(feedback.note);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedback?.note]);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -614,23 +630,18 @@ function ClipModal({
             </div>
           )}
 
-          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-            <button
-              className="btn sm primary"
-              disabled={busy || Boolean(clip.rebuild_pending)}
-              onClick={() => onRebuild({ needsContext })}
-            >
-              <IconRefresh width={12} height={12} />{" "}
-              {clip.rebuild_pending ? "Re-cut queued" : "Reprocess this clip"}
-            </button>
-            <button
-              className="btn sm"
-              disabled={busy || Boolean(clip.rebuild_pending)}
-              title="Re-cut with more footage around the moment"
-              onClick={() => onRebuild({ makeLonger: true, needsContext })}
-            >
-              <IconPlus width={12} height={12} /> Make longer
-            </button>
+          {/* Every control below is a setting for the re-cut: nothing is queued
+              until the one button is pressed, so the cut is decided in one go. */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label className="check-inline" title="Re-cut with more footage around the moment">
+              <input
+                type="checkbox"
+                checked={makeLonger}
+                disabled={busy || Boolean(clip.rebuild_pending)}
+                onChange={(event) => setMakeLonger(event.target.checked)}
+              />
+              Make it longer
+            </label>
             <label className="check-inline" title="Include the lead-up and full exchange, not just the payoff">
               <input
                 type="checkbox"
@@ -638,8 +649,60 @@ function ClipModal({
                 disabled={busy || Boolean(clip.rebuild_pending)}
                 onChange={(event) => setNeedsContext(event.target.checked)}
               />
-              Needs extra context
+              Include the setup (extra context)
             </label>
+            <div className="row" style={{ gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <span className="faint" style={{ fontSize: 10.5 }}>
+                Webcam position
+              </span>
+              <select
+                className="select"
+                value={webcamRegion}
+                disabled={busy || Boolean(clip.rebuild_pending)}
+                onChange={(event) => setWebcamRegion(event.target.value)}
+                style={{ fontSize: 11.5, padding: "4px 6px" }}
+              >
+                <option value="auto">Auto-detect</option>
+                {WEBCAM_REGION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+                <option value="none">No webcam</option>
+              </select>
+            </div>
+            <div className="field">
+              <span className="field-label">What should change (optional)</span>
+              <textarea
+                className="textarea"
+                rows={2}
+                maxLength={500}
+                value={direction}
+                disabled={busy || Boolean(clip.rebuild_pending)}
+                onChange={(event) => setDirection(event.target.value)}
+                placeholder="e.g. start earlier so the joke lands, keep the face cam big"
+              />
+            </div>
+          </div>
+
+          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            <button
+              className="btn sm primary"
+              disabled={busy || Boolean(clip.rebuild_pending)}
+              onClick={() =>
+                onRebuild({
+                  makeLonger,
+                  needsContext,
+                  webcamRegion: webcamRegion === "auto" ? undefined : webcamRegion,
+                  title: title.trim() || undefined,
+                  caption: caption.trim() || undefined,
+                  direction: direction.trim() || undefined,
+                })
+              }
+            >
+              <IconRefresh width={12} height={12} />{" "}
+              {clip.rebuild_pending ? "Re-cut queued" : "Re-cut with these settings"}
+            </button>
             <button
               className="btn sm"
               disabled={!suggestion || busy}
@@ -657,13 +720,13 @@ function ClipModal({
           <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
             {clip.rebuild_pending
               ? "Queued — waiting for the collector. The current cut stays playable until the new one replaces it."
-              : "Reprocess re-runs the transcription and cut for this clip only. Apply saves the suggestion for every other clip and for new moments."}
+              : "The re-cut uses these settings, the title and caption above, and what you wrote in Your take. Nothing is queued until you press Re-cut."}
           </div>
           <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
             {(() => {
               const box = parseWebcamBox(clip.webcam_json);
               if (!box) {
-                return "Webcam: none detected when this clip was analysed — Reprocess to try again.";
+                return "Webcam: none detected when this clip was analysed — Re-cut to try again.";
               }
               let region = "detected";
               try {
@@ -686,34 +749,6 @@ function ClipModal({
             })()}
           </div>
 
-          <div className="row" style={{ gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <span className="faint" style={{ fontSize: 10.5 }}>
-              Webcam position
-            </span>
-            <select
-              className="select"
-              value={webcamRegion}
-              disabled={busy || Boolean(clip.rebuild_pending)}
-              onChange={(event) => setWebcamRegion(event.target.value)}
-              style={{ fontSize: 11.5, padding: "4px 6px" }}
-            >
-              <option value="auto">Auto-detect</option>
-              {WEBCAM_REGION_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-              <option value="none">No webcam</option>
-            </select>
-            <button
-              className="btn sm"
-              disabled={webcamRegion === "auto" || busy || Boolean(clip.rebuild_pending)}
-              title="Re-cut this clip with the webcam in that position"
-              onClick={() => onRebuild({ webcamRegion, needsContext })}
-            >
-              Apply
-            </button>
-          </div>
         </div>
         </div>
 
