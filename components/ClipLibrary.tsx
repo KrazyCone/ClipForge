@@ -358,10 +358,23 @@ export function ClipLibrary({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ title, caption }),
     });
+    const data = (await res.json()) as { ok?: boolean; reburn?: boolean; error?: string };
     if (res.ok) {
-      setClips((prev) => prev.map((c) => (c.id === clip.id ? { ...c, title, caption } : c)));
-      setToast("Saved");
-    } else setToast("Save failed");
+      // A caption burned into the video is stale the moment it is edited, so the
+      // card shows the clip going back through the renderer with the new text.
+      const pending = data.reburn ? { status: "pending", r2_key: null, thumb_key: null } : {};
+      setClips((prev) =>
+        prev.map((c) => (c.id === clip.id ? { ...c, title, caption, ...pending } : c)),
+      );
+      setOpen((prev) =>
+        prev && prev.id === clip.id ? { ...prev, title, caption, ...pending } : prev,
+      );
+      setToast(
+        data.reburn
+          ? "Saved — re-rendering so the caption in the video matches"
+          : "Saved",
+      );
+    } else setToast(data.error ?? "Save failed");
   }
 
   if (clips.length === 0 && !initialSpikeId) {

@@ -498,11 +498,21 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
  * file covers the joined timeline.
  */
 /**
- * Face-forward layout: the webcam crop fills a 1080x600 band at the top and the
- * whole gameplay frame sits below it over a blurred fill. The band is sized so
- * the face is clearly bigger than in the full-frame layout without shrinking
- * the gameplay more than necessary; subtitles burn over the gameplay half.
+ * Face-forward layout. The webcam is a smaller band that sits below the very
+ * top of the frame instead of filling it, and the gameplay sits under that,
+ * slightly narrower and higher than before so the two do not crowd each other.
+ * The margin around both is the same frame, blurred, rather than black.
+ *
+ *   0                240   blurred backdrop
+ *   240..640              face band (1080x400)
+ *   670..1255             gameplay (1040 wide, aspect preserved)
+ *   1255..1920            blurred backdrop - subtitles burn here
  */
+const WC_FACE_H = 400;
+const WC_FACE_Y = 240;
+const WC_GAME_W = 1040;
+const WC_GAME_Y = 670;
+
 function webcamChains(
   source: string,
   box: WebcamBox,
@@ -517,13 +527,18 @@ function webcamChains(
     : `fps=30`;
   return [
     `[${source}]${prep},split=3[wcFaceSrc][wcGameSrc][wcBgSrc]`,
+    // The whole frame, blurred, is the backdrop for both bands: a top margin of
+    // black looked like a broken encode.
+    `[wcBgSrc]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,` +
+      `gblur=sigma=26[wcCanvas]`,
+    // Fitted to the band's height and centred, never cropped to fill it: a short
+    // wide band that covers its area slices the top of the head off, which is
+    // how a correct detection still looked wrong.
     `[wcFaceSrc]crop=iw*${f(box.w)}:ih*${f(box.h)}:iw*${f(box.x)}:ih*${f(box.y)},` +
-      `scale=1080:600:force_original_aspect_ratio=increase,crop=1080:600,setsar=1[wcFace]`,
-    `[wcGameSrc]scale=1080:1320:force_original_aspect_ratio=decrease[wcGameFit]`,
-    `[wcBgSrc]scale=1080:1320:force_original_aspect_ratio=increase,crop=1080:1320,gblur=sigma=26[wcGameBg]`,
-    `[wcGameBg][wcGameFit]overlay=(W-w)/2:(H-h)/2[wcGame]`,
-    `[wcGame]pad=1080:1920:0:600:black[wcPadded]`,
-    `[wcPadded][wcFace]overlay=0:0${assPath ? `,${assFilter(assPath)}` : ""}[${outLabel}]`,
+      `scale=-2:${WC_FACE_H},setsar=1[wcFace]`,
+    `[wcGameSrc]scale=${WC_GAME_W}:-2:force_original_aspect_ratio=decrease,setsar=1[wcGameFit]`,
+    `[wcCanvas][wcGameFit]overlay=(W-w)/2:${WC_GAME_Y}[wcStage]`,
+    `[wcStage][wcFace]overlay=(W-w)/2:${WC_FACE_Y}${assPath ? `,${assFilter(assPath)}` : ""}[${outLabel}]`,
   ];
 }
 

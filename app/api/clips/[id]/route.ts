@@ -6,6 +6,37 @@ import { denied } from "@/lib/guard";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Hands a clip back to the renderer and drops the current file, so the card
+ * shows it as processing until the new render lands.
+ */
+async function requeueRender(
+  d: D1Database,
+  clip: Clip,
+  options: { markRecut?: boolean } = {},
+): Promise<void> {
+  try {
+    const store = await files();
+    const keys = [clip.r2_key, clip.thumb_key].filter(Boolean) as string[];
+    if (keys.length) await store.delete(keys);
+  } catch {
+    /* the asset may already be gone */
+  }
+  await ensureClipStateColumns(d);
+  const now = new Date().toISOString();
+  await d
+    .prepare(
+      `UPDATE clips SET status = 'pending', r2_key = NULL, thumb_key = NULL, bytes = NULL,
+         error = NULL, watched_at = NULL${options.markRecut ? ", recut_at = ?" : ""}, updated_at = ?
+       WHERE id = ?`,
+    )
+    .bind(...(options.markRecut ? [now, now, clip.id] : [now, clip.id]))
+    .run();
+  if (clip.spike_id) {
+    await d.prepare("UPDATE spikes SET status = 'rendering' WHERE id = ?").bind(clip.spike_id).run();
+  }
+}
+
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const gate = await denied();
   if (gate) return gate;
@@ -24,26 +55,8 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       const d = await db();
       const clip = await d.prepare("SELECT * FROM clips WHERE id = ?").bind(id).first<Clip>();
       if (!clip) return json({ error: "clip not found" }, 404);
-      try {
-        const store = await files();
-        const keys = [clip.r2_key, clip.thumb_key].filter(Boolean) as string[];
-        if (keys.length) await store.delete(keys);
-      } catch {
-        /* asset may not exist */
-      }
-      await ensureClipStateColumns(d);
-      const now = new Date().toISOString();
-      await d
-        .prepare(
-          // The coming file is a new cut, so it counts as recently re-cut and has
-          // not been watched yet.
-          "UPDATE clips SET status = 'pending', r2_key = NULL, thumb_key = NULL, bytes = NULL, error = NULL, recut_at = ?, watched_at = NULL, updated_at = ? WHERE id = ?",
-        )
-        .bind(now, now, id)
-        .run();
-      if (clip.spike_id) {
-        await d.prepare("UPDATE spikes SET status = 'rendering' WHERE id = ?").bind(clip.spike_id).run();
-      }
+      // The coming file is a new cut, so it counts as recently re-cut.
+      await requeueRender(d, clip, { markRecut: true });
       // Start a renderer run now instead of waiting for the next scheduled one.
       const dispatched = await nudgeRenderer("clip reprocess");
       return json({ ok: true, queued: true, dispatched });
@@ -70,10 +83,26 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
 
   try {
     const d = await db();
+    const clip = await d.prepare("SELECT * FROM clips WHERE id = ?").bind(id).first<Clip>();
+    if (!clip) return json({ error: "clip not found" }, 404);
+
     sets.push("updated_at = ?");
     values.push(new Date().toISOString(), id);
     await d.prepare(`UPDATE clips SET ${sets.join(", ")} WHERE id = ?`).bind(...values).run();
-    return json({ ok: true });
+
+    // A clip with no spoken subtitles carries its caption as a card burned into
+    // the video, so saving a new caption only changes the listing until the
+    // file is rendered again. Rendering is what makes the video match the text.
+    const captionChanged =
+      typeof body.caption === "string" && body.caption.trim() !== (clip.caption ?? "").trim();
+    const captionIsBurned = !(clip.transcript ?? "").trim();
+    let reburn = false;
+    if (captionChanged && captionIsBurned && clip.status === "ready") {
+      await requeueRender(d, clip);
+      await nudgeRenderer("caption re-burn");
+      reburn = true;
+    }
+    return json({ ok: true, reburn });
   } catch (err) {
     return json({ error: String(err) }, 500);
   }
