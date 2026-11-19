@@ -234,6 +234,17 @@ export default async function DashboardPage() {
                 {collectorRun ? `${collectorRun.status} · ${ago(collectorRun.started_at)}` : "never run"}
               </span>
             </div>
+            {/* The channels the last run actually collected, so a flat chart can
+                be told apart from a channel nothing was listening to. */}
+            {collectorRun?.detail ? (
+              <div
+                className="faint truncate"
+                style={{ fontSize: 10.5, marginTop: -6 }}
+                title={collectorRun.detail}
+              >
+                {collectorRun.detail}
+              </div>
+            ) : null}
           </div>
         </section>
       </div>

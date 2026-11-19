@@ -230,12 +230,16 @@ export async function getDailyUsage(): Promise<Record<string, number>> {
   return safe(() => usageTotals(midnight), {});
 }
 
-export async function getLastRun(kind: string): Promise<{ started_at: string; status: string } | null> {
+export async function getLastRun(
+  kind: string,
+): Promise<{ started_at: string; status: string; detail: string | null } | null> {
   return safe(async () => {
     const d = await db();
     return await d
-      .prepare("SELECT started_at, status FROM runs WHERE kind = ? ORDER BY started_at DESC LIMIT 1")
+      .prepare(
+        "SELECT started_at, status, detail FROM runs WHERE kind = ? ORDER BY started_at DESC LIMIT 1",
+      )
       .bind(kind)
-      .first<{ started_at: string; status: string }>();
+      .first<{ started_at: string; status: string; detail: string | null }>();
   }, null);
 }

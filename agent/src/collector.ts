@@ -96,6 +96,10 @@ export class Collector {
   private stopping = false;
   private reconnectAttempts = 0;
   private joined = new Set<string>();
+  /** channels Twitch has confirmed the JOIN for on the current socket */
+  private joinConfirmed = new Set<string>();
+  /** re-join attempts per channel, so a dead channel cannot loop forever */
+  private joinRetries = new Map<string, number>();
   private recorders = new Map<string, LiveRecorder>();
   private vod = new TwitchVod();
   private liveRenders = 0;
@@ -128,9 +132,19 @@ export class Collector {
     const queue = await this.api.queue(1);
     this.settings = queue.settings;
 
-    const channels = queue.channels
-      .filter((c) => c.capture_mode !== "none")
-      .slice(0, Math.min(this.cfg.maxChannels, queue.settings.maxChannels));
+    // MAX_CHANNELS is the hard cost limit. settings.maxChannels only guards the
+    // "add channel" button; applying both here meant lowering that setting
+    // silently stopped collecting channels that were already being watched, and
+    // their charts just went flat with nothing explaining why.
+    const monitored = queue.channels.filter((c) => c.capture_mode !== "none");
+    const channels = monitored.slice(0, this.cfg.maxChannels);
+    const overCap = monitored.slice(this.cfg.maxChannels).map((c) => c.login);
+    if (overCap.length) {
+      log(
+        `MAX_CHANNELS=${this.cfg.maxChannels} - not collecting ${overCap.join(", ")} ` +
+          `(raise it in the workflow to cover every channel)`,
+      );
+    }
 
     if (channels.length === 0) {
       log("no monitored channels - nothing to collect");
@@ -193,7 +207,14 @@ export class Collector {
     } catch {
       /* already closed */
     }
-    await this.api.recordRun("collector", "stopped", reason);
+    // The collected list is on the stop record because that is the newest row:
+    // it is how the dashboard can show which channels the run covered.
+    const collected = [...this.states.keys()].join(",");
+    await this.api.recordRun(
+      "collector",
+      "stopped",
+      collected ? `${reason} - collected ${collected}` : reason,
+    );
     this.onStop?.();
   }
 
@@ -213,6 +234,11 @@ export class Collector {
         } else {
           ws.send(`NICK ${anonNick()}`);
         }
+        // A fresh socket starts with nothing confirmed: Twitch can accept the
+        // connection and still drop a JOIN, which shows up later as one channel
+        // with a perfectly flat chat line and no error anywhere.
+        this.joinConfirmed.clear();
+        this.joinRetries.clear();
         for (const login of this.states.keys()) {
           ws.send(`JOIN #${login}`);
           this.joined.add(login);
@@ -251,6 +277,14 @@ export class Collector {
 
       if (line.startsWith("PING")) {
         this.ws?.send("PONG :tmi.twitch.tv");
+        continue;
+      }
+
+      // `:name!name@name.tmi.twitch.tv JOIN #channel` is the only proof that
+      // chat for that channel will actually arrive.
+      const joinAt = line.indexOf(" JOIN #");
+      if (joinAt > 0) {
+        this.joinConfirmed.add(line.slice(joinAt + " JOIN #".length).trim().toLowerCase());
         continue;
       }
 
@@ -470,6 +504,19 @@ export class Collector {
       return;
     }
 
+    // A JOIN that was never confirmed is a silent hole: no messages means no
+    // chart, no spike and no error. Re-ask a few times instead of leaving it.
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      for (const login of this.states.keys()) {
+        if (this.joinConfirmed.has(login)) continue;
+        const retries = this.joinRetries.get(login) ?? 0;
+        if (retries >= 3) continue;
+        this.joinRetries.set(login, retries + 1);
+        this.ws.send(`JOIN #${login}`);
+        log(`irc join unconfirmed for #${login} - re-joining (attempt ${retries + 2})`);
+      }
+    }
+
     if (now - this.lastBeatAt >= HEARTBEAT_MS) {
       // The last-detection age makes a dead detector visible: heartbeats alone
       // stay healthy while no spike can be emitted at all.
@@ -479,10 +526,12 @@ export class Collector {
       const lastPass = this.lastDetectPassAt
         ? `${Math.round((now - this.lastDetectPassAt * 1000) / 60_000)} min ago`
         : "never";
+      const unconfirmed = [...this.states.keys()].filter((l) => !this.joinConfirmed.has(l));
       log(
         `heartbeat: ${this.states.size} channel(s) joined, ${this.recorders.size} buffering, ` +
           `${this.messagesSinceBeat} chat message(s) in the last ${Math.round((now - this.lastBeatAt) / 60_000)} min, ` +
-          `last detector pass ${lastPass}, last spike ${lastSpike}`,
+          `last detector pass ${lastPass}, last spike ${lastSpike}` +
+          (unconfirmed.length ? `, join unconfirmed for ${unconfirmed.join(",")}` : ""),
       );
       this.lastBeatAt = now;
       this.messagesSinceBeat = 0;
@@ -593,8 +642,9 @@ export class Collector {
       );
 
       // The cap applies for the whole run, not just at startup: a long run can
-      // see more channels go live than MAX_CHANNELS allows.
-      const cap = Math.min(this.cfg.maxChannels, this.settings?.maxChannels ?? this.cfg.maxChannels);
+      // see more channels go live than MAX_CHANNELS allows. It is the workflow's
+      // limit only - see the startup note about settings.maxChannels.
+      const cap = this.cfg.maxChannels;
       let capped = false;
       for (const channel of live.channels) {
         if (channel.capture_mode === "none") continue;

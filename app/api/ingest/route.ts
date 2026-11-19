@@ -54,16 +54,46 @@ export async function POST(req: Request) {
   const e = await env();
   try {
     const d = await db();
+    const now = new Date().toISOString();
+    const statements: D1PreparedStatement[] = [];
+    let writes = 0;
+
+    // A run record describes the worker itself, not a channel. It used to be
+    // rejected by the channel lookup below (the collector reports it with the
+    // sentinel login "__run__", which is not a channel), so no run was ever
+    // stored and the dashboard said the collector had never run.
+    if (body.run) {
+      statements.push(
+        d
+          .prepare(
+            "INSERT INTO runs (id, kind, started_at, finished_at, status, detail) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .bind(
+            crypto.randomUUID(),
+            String(body.run.kind).slice(0, 40),
+            now,
+            body.run.finishedAt ?? now,
+            String(body.run.status).slice(0, 40),
+            String(body.run.detail ?? "").slice(0, 500),
+          ),
+      );
+      writes++;
+    }
+
     const channel = await d
       .prepare("SELECT id, login, capture_mode, moments FROM channels WHERE login = ?")
       .bind(body.login.toLowerCase())
       .first<{ id: string; login: string; capture_mode: string; moments: number }>();
-    if (!channel) return json({ error: `channel ${body.login} is not monitored` }, 404);
+
+    if (!channel) {
+      // A run-only payload is complete on its own; anything else still needs a
+      // real channel to point at.
+      if (!writes) return json({ error: `channel ${body.login} is not monitored` }, 404);
+      await d.batch(statements);
+      return json({ ok: true, run: true, writes });
+    }
 
     const settings = await getSettings();
-    const now = new Date().toISOString();
-    const statements: D1PreparedStatement[] = [];
-    let writes = 0;
 
     if (body.minute) {
       const m = body.minute;
@@ -165,22 +195,6 @@ export async function POST(req: Request) {
         );
         writes += 2;
       }
-    }
-
-    if (body.run) {
-      statements.push(
-        d
-          .prepare("INSERT INTO runs (id, kind, started_at, finished_at, status, detail) VALUES (?, ?, ?, ?, ?, ?)")
-          .bind(
-            crypto.randomUUID(),
-            String(body.run.kind).slice(0, 40),
-            now,
-            body.run.finishedAt ?? now,
-            String(body.run.status).slice(0, 40),
-            String(body.run.detail ?? "").slice(0, 500),
-          ),
-      );
-      writes++;
     }
 
     if (statements.length) await d.batch(statements);
