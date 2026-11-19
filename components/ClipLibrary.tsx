@@ -341,10 +341,12 @@ export function ClipLibrary({
       body: JSON.stringify({ reprocess: true }),
     });
     if (res.ok) {
+      // The current video stays playable until the new render lands, so a
+      // re-render that fails no longer leaves the clip blank.
       setClips((prev) =>
-        prev.map((c) => (c.id === clip.id ? { ...c, status: "pending", r2_key: null, thumb_key: null } : c)),
+        prev.map((c) => (c.id === clip.id ? { ...c, status: "pending" } : c)),
       );
-      setToast("Queued for re-render");
+      setToast("Queued for re-render — the current cut plays until it lands");
       setOpen(null);
     } else {
       setToast("Requeue failed");
@@ -362,7 +364,7 @@ export function ClipLibrary({
     if (res.ok) {
       // A caption burned into the video is stale the moment it is edited, so the
       // card shows the clip going back through the renderer with the new text.
-      const pending = data.reburn ? { status: "pending", r2_key: null, thumb_key: null } : {};
+      const pending = data.reburn ? { status: "pending" } : {};
       setClips((prev) =>
         prev.map((c) => (c.id === clip.id ? { ...c, title, caption, ...pending } : c)),
       );
@@ -371,7 +373,7 @@ export function ClipLibrary({
       );
       setToast(
         data.reburn
-          ? "Saved — re-rendering so the caption in the video matches"
+          ? "Saved — re-rendering so the caption in the video matches (the current cut plays until then)"
           : "Saved",
       );
     } else setToast(data.error ?? "Save failed");
@@ -676,7 +678,7 @@ function ClipModal({
         </button>
         <div className="modal-media">
         <div className="modal-video">
-          {clip.r2_key && clip.status === "ready" ? (
+          {clip.r2_key ? (
             <video
               src={`/api/media/${clip.r2_key}`}
               poster={clip.thumb_key ? `/api/media/${clip.thumb_key}` : undefined}

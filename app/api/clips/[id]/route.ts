@@ -7,27 +7,21 @@ import { denied } from "@/lib/guard";
 export const dynamic = "force-dynamic";
 
 /**
- * Hands a clip back to the renderer and drops the current file, so the card
- * shows it as processing until the new render lands.
+ * Hands a clip back to the renderer. The current file is deliberately left in
+ * place: dropping it first meant a re-cut that failed - or one whose analysis
+ * scored below the floor - left the clip with no video at all.
  */
 async function requeueRender(
   d: D1Database,
   clip: Clip,
   options: { markRecut?: boolean } = {},
 ): Promise<void> {
-  try {
-    const store = await files();
-    const keys = [clip.r2_key, clip.thumb_key].filter(Boolean) as string[];
-    if (keys.length) await store.delete(keys);
-  } catch {
-    /* the asset may already be gone */
-  }
   await ensureClipStateColumns(d);
   const now = new Date().toISOString();
   await d
     .prepare(
-      `UPDATE clips SET status = 'pending', r2_key = NULL, thumb_key = NULL, bytes = NULL,
-         error = NULL, watched_at = NULL${options.markRecut ? ", recut_at = ?" : ""}, updated_at = ?
+      `UPDATE clips SET status = 'pending', error = NULL, watched_at = NULL
+         ${options.markRecut ? ", recut_at = ?" : ""}, updated_at = ?
        WHERE id = ?`,
     )
     .bind(...(options.markRecut ? [now, now, clip.id] : [now, clip.id]))
@@ -97,7 +91,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       typeof body.caption === "string" && body.caption.trim() !== (clip.caption ?? "").trim();
     const captionIsBurned = !(clip.transcript ?? "").trim();
     let reburn = false;
-    if (captionChanged && captionIsBurned && clip.status === "ready") {
+    if (captionChanged && captionIsBurned && clip.r2_key) {
       await requeueRender(d, clip);
       await nudgeRenderer("caption re-burn");
       reburn = true;

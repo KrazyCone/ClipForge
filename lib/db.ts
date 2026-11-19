@@ -102,6 +102,11 @@ export function ensureClipStateColumns(d: D1Database): Promise<void> {
       for (const sql of [
         "ALTER TABLE clips ADD COLUMN recut_at TEXT",
         "ALTER TABLE clips ADD COLUMN watched_at TEXT",
+        // The footage a clip was cut from. Twitch has no archive VOD while a
+        // stream is live, so without this a re-cut of a live moment has nothing
+        // to cut from. A few seconds of the source are enough for any re-cut.
+        "ALTER TABLE clips ADD COLUMN source_key TEXT",
+        "ALTER TABLE clips ADD COLUMN source_start_sec REAL",
       ]) {
         await d.prepare(sql).run().catch(() => undefined);
       }

@@ -768,9 +768,13 @@ export class Collector {
     try {
       // The analyser decides where the clip starts and ends, so capture enough
       // footage around the peak for it to choose from rather than just the
-      // configured pre/post roll.
-      const lead = Math.max(settings.preEventSec, 15);
-      const tail = Math.max(settings.postEventSec, 15);
+      // configured pre/post roll. A re-cut that was asked to make the clip
+      // longer needs more than the default 15s either side, or its beats run
+      // past the end of the snapshot and every cut collapses onto the last few
+      // seconds of the source.
+      const wanted = Math.max(settings.clipDurationSec ?? 30, 20);
+      const lead = Math.max(settings.preEventSec, 15, Math.ceil(wanted * 0.6));
+      const tail = Math.max(settings.postEventSec, 15, Math.ceil(wanted * 0.6));
 
       // Wait for the post-roll to be written into the buffer. A rebuild is
       // already minutes old, so there is nothing to wait for.
@@ -848,6 +852,9 @@ export class Collector {
         transcript: analysis.transcript,
         beats: analysis.beats,
         captions: analysis.captions,
+        // A live moment has no archive VOD to re-cut from; keeping the footage
+        // is what makes its re-cuts work now instead of when the stream ends.
+        saveSource: true,
       });
     } catch (err) {
       log(`live capture failed for ${state.login}: ${err instanceof Error ? err.message : String(err)}`);

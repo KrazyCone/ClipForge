@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS clips (
   webcam_json   TEXT,                   -- detected face-cam crop for the layout
   recut_at      TEXT,                   -- when this clip was last re-cut
   watched_at    TEXT,                   -- cleared the "ready" badge once opened
+  source_key    TEXT,                   -- R2 key of the footage this cut came from
+  source_start_sec REAL,                -- wall clock of that footage's first frame
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );

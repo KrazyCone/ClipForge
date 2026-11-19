@@ -20,10 +20,17 @@ import type {
   TimedCaption,
 } from "./api.js";
 import type { TwitchVod } from "./twitch.js";
-import { audioLoudness, extractAudio, planLeadSkip, sampleFrames, thumbnail } from "./ffmpeg.js";
+import {
+  audioLoudness,
+  extractAudio,
+  ffprobeDuration,
+  planLeadSkip,
+  sampleFrames,
+  thumbnail,
+} from "./ffmpeg.js";
 import { buildAss, buildAssTimed, buildCaptionAss, shiftCaptions } from "./subtitles.js";
 import { describeWebcam, parseWebcamBox } from "./webcam.js";
-import { renderWithFallback } from "./produce.js";
+import { produceClipFromFile, renderWithFallback } from "./produce.js";
 
 /**
  * Twitch only publishes a broadcast as an archive VOD once the stream ends, so
@@ -72,7 +79,37 @@ async function analyzeSpike(
   }
 
   const found = await vod.findVodFor(spike.channel_id, spike.ts_unix);
-  if (!found) {
+
+  // A re-cut of a moment from a stream that is still live has no archive VOD,
+  // and this job has no ring buffer. The footage kept with the clip is the
+  // source then, so the re-cut runs instead of sitting queued for days.
+  let source: string | null = null;
+  let start = 0;
+  let windowStartSec = 0;
+  if (found) {
+    source = await vod.playlistFor(found.video.id);
+    start = Math.max(0, found.offset - 15);
+    windowStartSec = start - found.offset;
+  } else if (spike.clip_id && spike.clip_source_key) {
+    const local = path.join(workDir, `${spike.id}-source.ts`);
+    try {
+      await writeFile(local, await api.downloadSource(spike.clip_id));
+      const length = await ffprobeDuration(local).catch(() => 0);
+      const inSource = spike.ts_unix - (Number(spike.clip_source_start) || 0);
+      start = Math.max(0, Math.min(inSource - 15, Math.max(0, length - 12)));
+      // Beats are placed on the spike's own timeline, so the window is too.
+      windowStartSec = start - inSource;
+      source = local;
+      log(`spike ${spike.id}: re-cutting from the footage kept with the clip (${length.toFixed(0)}s)`);
+    } catch (err) {
+      log(
+        `spike ${spike.id}: kept footage unavailable ` +
+          `(${err instanceof Error ? err.message.slice(0, 160) : String(err)})`,
+      );
+    }
+  }
+
+  if (!source) {
     const age = ageSeconds(spike.ts_unix);
     if (age > MAX_VOD_WAIT_SEC) {
       await failSpike(api, spike.id, "no archive VOD covers this moment (chat-only capture)");
@@ -85,19 +122,16 @@ async function analyzeSpike(
     return "deferred";
   }
 
-  const playlist = await vod.playlistFor(found.video.id);
-  const start = Math.max(0, found.offset - 15);
-
-  const frames = await sampleFrames(playlist, start, 30, 0.4, workDir);
-  const audio = await extractAudio(playlist, start, 30, workDir);
-  const loudness = await audioLoudness(playlist, start, 30).catch(() => []);
+  const frames = await sampleFrames(source, start, 30, 0.4, workDir);
+  const audio = await extractAudio(source, start, 30, workDir);
+  const loudness = await audioLoudness(source, start, 30).catch(() => []);
 
   log(`spike ${spike.id}: sampled ${frames.length} frames, audio ${audio ? audio.length : 0} bytes`);
 
   const result = await api.analyze(spike.id, {
     frames: frames.map((f) => f.toString("base64")),
     audioBase64: audio ? audio.toString("base64") : undefined,
-    windowStartSec: start - found.offset,
+    windowStartSec,
     loudness: loudness.map((sample) => Math.round(sample.db * 10) / 10),
     loudnessBucketSec: 0.5,
   });
@@ -109,6 +143,62 @@ async function analyzeSpike(
   return result.clipId ? "done" : "skipped";
 }
 
+/**
+ * Renders a re-cut from the footage kept with the clip, with the beats the
+ * latest analysis stored. Returns null when there is no footage to use.
+ */
+async function renderStoredSource(
+  api: ClipforgeApi,
+  clip: QueueClip,
+  settings: AgentSettings,
+  workDir: string,
+): Promise<Outcome | null> {
+  let beats: AnalyzeBeat[] = [];
+  let captions: TimedCaption[] = [];
+  try {
+    const ai = JSON.parse(clip.spike_ai_json ?? "{}") as {
+      beats?: AnalyzeBeat[];
+      captions?: TimedCaption[];
+    };
+    if (Array.isArray(ai.beats)) beats = ai.beats;
+    if (Array.isArray(ai.captions)) captions = ai.captions;
+  } catch {
+    // An older clip has no plan; its stored span still renders.
+  }
+
+  const sourcePath = path.join(workDir, `${clip.id}-source.ts`);
+  try {
+    await writeFile(sourcePath, await api.downloadSource(clip.id));
+  } catch (err) {
+    log(
+      `clip ${clip.id}: no archive VOD and no kept footage ` +
+        `(${err instanceof Error ? err.message.slice(0, 160) : String(err)})`,
+    );
+    return null;
+  }
+
+  const length = await ffprobeDuration(sourcePath).catch(() => 0);
+  if (!length) {
+    log(`clip ${clip.id}: kept footage is unreadable`);
+    return null;
+  }
+
+  log(`clip ${clip.id}: re-cutting from the footage kept with the clip (${length.toFixed(0)}s)`);
+  await produceClipFromFile({
+    api,
+    clip,
+    sourceFile: sourcePath,
+    sourceStartSec: Number(clip.source_start_sec) || 0,
+    sourceDurationSec: length,
+    settings,
+    workDir,
+    transcript: clip.transcript ?? "",
+    beats: beats.length ? beats : undefined,
+    captions,
+  });
+  return "done";
+}
+
 async function renderClipJob(
   api: ClipforgeApi,
   vod: TwitchVod,
@@ -116,14 +206,26 @@ async function renderClipJob(
   settings: AgentSettings,
   workDir: string,
 ): Promise<Outcome> {
-  if (!clip.channel_id || !clip.source_ts) {
-    log(`clip ${clip.id}: missing channel or timestamp`);
-    await api.failClip(clip.id, "clip has no channel or timestamp");
+  if (!clip.source_ts) {
+    log(`clip ${clip.id}: missing timestamp`);
+    await api.failClip(clip.id, "clip has no timestamp");
+    return "skipped";
+  }
+  if (!clip.channel_id) {
+    // No channel means no VOD lookup, but the kept footage is still a source.
+    const stored = await renderStoredSource(api, clip, settings, workDir);
+    if (stored) return stored;
+    log(`clip ${clip.id}: missing channel`);
+    await api.failClip(clip.id, "clip has no channel");
     return "skipped";
   }
 
   const found = await vod.findVodFor(clip.channel_id, clip.source_ts);
   if (!found) {
+    // Same reason as above: the clip's own footage is a source of its own, so
+    // a re-cut of a live moment does not wait for the stream to end.
+    const stored = await renderStoredSource(api, clip, settings, workDir);
+    if (stored) return stored;
     const created = clip.created_at ? Date.parse(clip.created_at) / 1000 : clip.source_ts;
     const age = ageSeconds(Number.isFinite(created) ? created : clip.source_ts);
     if (age > MAX_VOD_WAIT_SEC) {
@@ -274,7 +376,10 @@ export async function drainQueue(opts: DrainOptions): Promise<DrainResult> {
   try {
     for (const spike of spikes) {
       try {
-        if (liveLogins.has(spike.channel_login.toLowerCase())) {
+        // A live channel has no archive VOD, which used to defer every re-cut of
+        // one for the length of the stream. A moment whose footage was kept
+        // with its clip can be analysed right now, so it is not deferred.
+        if (liveLogins.has(spike.channel_login.toLowerCase()) && !spike.clip_source_key) {
           result.deferred++;
           continue;
         }

@@ -1,4 +1,4 @@
-import { db, env, getSettings } from "@/lib/db";
+import { db, ensureClipStateColumns, env, getSettings } from "@/lib/db";
 import { isIngestAuthorized, json } from "@/lib/api";
 import type { Channel, Clip, Spike } from "@/lib/types";
 
@@ -14,6 +14,7 @@ export async function GET(req: Request) {
 
   try {
     const d = await db();
+    await ensureClipStateColumns(d);
     const settings = await getSettings();
     const url = new URL(req.url);
     const limit = Math.min(Number(url.searchParams.get("limit") ?? 3), 10);
@@ -23,8 +24,12 @@ export async function GET(req: Request) {
         .prepare(
           // Re-cuts first: somebody asked for them, so they must not wait behind
           // a backlog of freshly detected moments.
-          `SELECT s.*, c.title AS stream_title, c.game_name, c.display_name, c.avatar_url, c.capture_mode
+          // The clip's kept footage travels with the spike: a re-cut of a live
+          // moment is analysed from it when Twitch has no archive VOD yet.
+          `SELECT s.*, c.title AS stream_title, c.game_name, c.display_name, c.avatar_url, c.capture_mode,
+             cl.id AS clip_id, cl.source_key AS clip_source_key, cl.source_start_sec AS clip_source_start
            FROM spikes s JOIN channels c ON c.id = s.channel_id
+           LEFT JOIN clips cl ON cl.spike_id = s.id
            WHERE s.status = 'queued' AND s.merged_into IS NULL
            ORDER BY (s.analyze_json IS NOT NULL) DESC, s.intensity DESC, s.ts_unix ASC LIMIT ?`,
         )
@@ -38,6 +43,9 @@ export async function GET(req: Request) {
           `SELECT c.*, s.ai_json AS spike_ai_json
            FROM clips c LEFT JOIN spikes s ON s.id = c.spike_id
            WHERE c.status = 'pending' AND c.created_at < ?
+             -- A clip whose moment is being re-analysed right now must not be
+             -- rendered with the beat plan the analysis is about to replace.
+             AND s.analyze_json IS NULL
            ORDER BY c.created_at ASC LIMIT ?`,
         )
         .bind(new Date(Date.now() - 3 * 60 * 1000).toISOString(), limit)

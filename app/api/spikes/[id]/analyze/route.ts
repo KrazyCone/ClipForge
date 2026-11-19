@@ -471,10 +471,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     if (analysis.qualityScore < effectiveFloor) {
       const stale = await d
-        .prepare("SELECT id FROM clips WHERE spike_id = ?")
+        .prepare("SELECT id, r2_key FROM clips WHERE spike_id = ?")
         .bind(id)
-        .first<{ id: string }>();
-      if (stale) {
+        .first<{ id: string; r2_key: string | null }>();
+      if (stale && !stale.r2_key) {
         await d
           .prepare("UPDATE clips SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
           .bind(
@@ -482,6 +482,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
             now,
             stale.id,
           )
+          .run();
+      } else if (stale) {
+        // A re-cut that scored below the floor keeps the cut that already
+        // exists instead of replacing it with a failed, empty clip.
+        await d
+          .prepare("UPDATE clips SET status = 'ready', error = NULL, updated_at = ? WHERE id = ?")
+          .bind(now, stale.id)
           .run();
       }
       await d.prepare("UPDATE spikes SET analyze_json = NULL WHERE id = ?").bind(id).run();
@@ -508,8 +515,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
              -- The new cut is a different video: it counts as recently re-cut and
              -- has not been watched yet, so its ready badge comes back.
              recut_at = ?, watched_at = NULL,
-             status = 'pending', error = NULL, r2_key = NULL, thumb_key = NULL, bytes = NULL,
-             updated_at = ?
+             -- The current video stays playable until the new one is uploaded:
+             -- clearing it here is what made a re-cut look like a deleted clip.
+             status = 'pending', error = NULL, updated_at = ?
            WHERE id = ?`,
         )
         .bind(

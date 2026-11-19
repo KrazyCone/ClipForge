@@ -6,6 +6,7 @@ import { rm, writeFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   audioLoudness,
+  cutCopy,
   ffprobeStreamDurations,
   planLeadSkip,
   renderClip,
@@ -40,6 +41,8 @@ export interface ProduceOptions {
   beats?: AnalyzeBeat[];
   /** subtitles already remapped onto the assembled timeline */
   captions?: TimedCaption[];
+  /** keep the footage this clip was cut from, so it can be re-cut later */
+  saveSource?: boolean;
 }
 
 /**
@@ -159,6 +162,30 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
     `live clip ${clip.id}: ${(video.length / 1048576).toFixed(1)} MB, ${duration.toFixed(1)}s` +
       (joined ? ` joined from ${cuts.length} cuts` : ""),
   );
+
+  // Twitch only archives a stream once it ends, so this window is the only
+  // thing a re-cut of a live moment can be cut from. A failure here costs the
+  // re-cut, never the clip.
+  if (opts.saveSource) {
+    try {
+      const from = Math.max(0, startInSource - 4);
+      const room = opts.sourceDurationSec
+        ? Math.max(1, opts.sourceDurationSec - from)
+        : duration + 8;
+      // More than the clip needs: a re-cut can ask for a longer clip, and the
+      // beats it plans must still land inside this window.
+      const keepFor = Math.min(duration + 25, room);
+      const keepPath = path.join(workDir, "source.ts");
+      await cutCopy(sourceFile, from, keepFor, keepPath);
+      await api.uploadSource(clip.id, await readFile(keepPath), sourceStartSec + from);
+      log(`live clip ${clip.id}: kept ${keepFor.toFixed(0)}s of source for re-cuts`);
+    } catch (err) {
+      log(
+        `live clip ${clip.id}: could not keep source ` +
+          `(${err instanceof Error ? err.message.slice(0, 200) : String(err)})`,
+      );
+    }
+  }
   return duration;
 }
 

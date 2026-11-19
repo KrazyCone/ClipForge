@@ -29,6 +29,11 @@ export interface QueueSpike {
   samples_json: string | null;
   /** non-null when this is a re-cut rather than a freshly detected moment */
   analyze_json?: string | null;
+  /** the clip belonging to this moment, when one exists (re-cuts) */
+  clip_id?: string | null;
+  /** footage kept with that clip, usable when no archive VOD exists yet */
+  clip_source_key?: string | null;
+  clip_source_start?: number | null;
   stream_title: string;
   game_name: string;
   display_name: string;
@@ -55,6 +60,10 @@ export interface QueueClip {
   transcript: string | null;
   /** detected webcam crop, `{ visible, region, size, box }` */
   webcam_json?: string | null;
+  /** R2 key of the footage this clip was cut from, if it was kept */
+  source_key?: string | null;
+  /** wall-clock unix seconds of the first frame of that footage */
+  source_start_sec?: number | null;
   status: string;
   created_at?: string;
 }
@@ -256,6 +265,27 @@ export class ClipforgeApi {
     const res = await this.request("/api/clips/upload", { method: "POST", body: form }, 240_000);
     if (!res.ok) throw new Error(`upload ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return (await res.json()) as { ok: boolean; mediaUrl?: string };
+  }
+
+  /** Stores the footage a clip was cut from, so a re-cut never waits on Twitch. */
+  async uploadSource(clipId: string, source: Buffer, startSec: number): Promise<void> {
+    const res = await this.request(
+      `/api/clips/${clipId}/source?startSec=${startSec.toFixed(2)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "video/mp2t" },
+        body: new Uint8Array(source),
+      } as RequestInit,
+      240_000,
+    );
+    if (!res.ok) throw new Error(`source upload ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
+
+  /** Downloads that footage for a re-cut. */
+  async downloadSource(clipId: string): Promise<Buffer> {
+    const res = await this.request(`/api/clips/${clipId}/source`, {}, 240_000);
+    if (!res.ok) throw new Error(`source ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    return Buffer.from(await res.arrayBuffer());
   }
 
   async recordRun(kind: string, status: string, detail: string): Promise<void> {

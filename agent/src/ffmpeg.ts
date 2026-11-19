@@ -631,6 +631,32 @@ async function renderJoined(
   await ffmpeg(args, opts.timeoutMs ?? 300_000);
 }
 
+/**
+ * Copies a window of a source without re-encoding. Used to keep the footage a
+ * clip was cut from, so a re-cut has something to cut from while the stream is
+ * still live and Twitch has published no archive VOD.
+ */
+export async function cutCopy(
+  input: string,
+  startSec: number,
+  durationSec: number,
+  outPath: string,
+): Promise<void> {
+  await ffmpeg(
+    [
+      "-hide_banner", "-loglevel", "error",
+      "-ss", Math.max(0, startSec).toFixed(3),
+      "-t", Math.max(1, durationSec).toFixed(2),
+      "-i", input,
+      "-map", "0:v:0?", "-map", "0:a:0?",
+      "-c", "copy",
+      "-avoid_negative_ts", "make_zero",
+      "-y", outPath,
+    ],
+    120_000,
+  );
+}
+
 export async function thumbnail(videoPath: string, outPath: string): Promise<void> {
   await ffmpeg([
     "-hide_banner",
