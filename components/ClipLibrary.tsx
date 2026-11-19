@@ -17,7 +17,7 @@ import {
 } from "./icons";
 import { ClipFeedbackBox } from "./ClipFeedback";
 import { parseReasons, summariseFeedback } from "@/lib/feedback";
-import { parseWebcamBox } from "@/lib/webcam";
+import { parseWebcamBox, WEBCAM_REGION_OPTIONS } from "@/lib/webcam";
 import type {
   ClipFeedback,
   FeedbackSentiment,
@@ -658,7 +658,10 @@ function ClipModal({
                   size?: string;
                 };
                 if (stored.region) {
-                  region = `${stored.region.replace("-", " ")}${stored.size ? `, ${stored.size}` : ""}`;
+                  const label =
+                    WEBCAM_REGION_OPTIONS.find((option) => option.value === stored.region)?.label ??
+                    stored.region.split("-").join(" ");
+                  region = `${label.toLowerCase()}${stored.size ? `, ${stored.size}` : ""}`;
                 }
               } catch {
                 /* keep the generic label */
@@ -681,16 +684,17 @@ function ClipModal({
               style={{ fontSize: 11.5, padding: "4px 6px" }}
             >
               <option value="auto">Auto-detect</option>
-              <option value="top-left">Top left</option>
-              <option value="top-right">Top right</option>
-              <option value="bottom-left">Bottom left</option>
-              <option value="bottom-right">Bottom right</option>
+              {WEBCAM_REGION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
               <option value="none">No webcam</option>
             </select>
             <button
               className="btn sm"
               disabled={webcamRegion === "auto" || busy || Boolean(clip.rebuild_pending)}
-              title="Re-cut this clip with the webcam in that corner"
+              title="Re-cut this clip with the webcam in that position"
               onClick={() => onRebuild({ webcamRegion, needsContext })}
             >
               Apply

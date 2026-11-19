@@ -33,6 +33,92 @@ const CELLS: Record<string, [number, number]> = {
   "bottom-right": [5 / 6, 5 / 6],
 };
 
+/**
+ * Every placement the UI offers, in reading order. Plenty of streamers put the
+ * cam halfway up the left or right edge rather than in a corner, so the middle
+ * row is a first-class choice, not something only the model can guess.
+ */
+export const WEBCAM_REGION_OPTIONS: { value: string; label: string }[] = [
+  { value: "top-left", label: "Top left" },
+  { value: "top-center", label: "Top middle" },
+  { value: "top-right", label: "Top right" },
+  { value: "mid-left", label: "Middle left" },
+  { value: "mid-center", label: "Middle" },
+  { value: "mid-right", label: "Middle right" },
+  { value: "bottom-left", label: "Bottom left" },
+  { value: "bottom-center", label: "Bottom middle" },
+  { value: "bottom-right", label: "Bottom right" },
+];
+
+/**
+ * The model, and people, describe the same cell in several ways ("middle left",
+ * "left-middle", "centre left", "left side"). Every spelling collapses onto the
+ * nine canonical regions instead of throwing an otherwise usable detection away.
+ */
+const REGION_ALIASES: Record<string, string> = {
+  "top left": "top-left",
+  "upper left": "top-left",
+  "top middle": "top-center",
+  "top center": "top-center",
+  "top centre": "top-center",
+  "upper middle": "top-center",
+  "upper center": "top-center",
+  "upper centre": "top-center",
+  "top right": "top-right",
+  "upper right": "top-right",
+  "middle left": "mid-left",
+  "mid left": "mid-left",
+  "left middle": "mid-left",
+  "left mid": "mid-left",
+  "center left": "mid-left",
+  "centre left": "mid-left",
+  "left center": "mid-left",
+  "left centre": "mid-left",
+  "left side": "mid-left",
+  left: "mid-left",
+  "middle center": "mid-center",
+  "middle centre": "mid-center",
+  "dead center": "mid-center",
+  "dead centre": "mid-center",
+  middle: "mid-center",
+  center: "mid-center",
+  centre: "mid-center",
+  "middle right": "mid-right",
+  "mid right": "mid-right",
+  "right middle": "mid-right",
+  "right mid": "mid-right",
+  "center right": "mid-right",
+  "centre right": "mid-right",
+  "right center": "mid-right",
+  "right centre": "mid-right",
+  "right side": "mid-right",
+  right: "mid-right",
+  "bottom left": "bottom-left",
+  "lower left": "bottom-left",
+  "bottom middle": "bottom-center",
+  "bottom center": "bottom-center",
+  "bottom centre": "bottom-center",
+  "lower middle": "bottom-center",
+  "lower center": "bottom-center",
+  "lower centre": "bottom-center",
+  "bottom right": "bottom-right",
+  "lower right": "bottom-right",
+};
+
+/** Coerces any spelling of a placement onto one of the nine canonical cells. */
+export function canonicalRegion(raw: unknown): string | null {
+  const text = String(raw ?? "")
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\bcorner\b/gi, "")
+    .replace(/\bof the (screen|frame)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return null;
+  if (text in CELLS) return text;
+  return REGION_ALIASES[text] ?? null;
+}
+
 const WIDTHS: Record<string, number> = {
   small: 0.2,
   medium: 0.26,
@@ -49,10 +135,12 @@ const round = (v: number) => Math.round(v * 10_000) / 10_000;
 export function normaliseHint(raw: unknown): WebcamHint | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
-  const visible = value.webcam ?? value.visible;
-  if (visible !== true) return null;
-  const region = String(value.region ?? "").toLowerCase();
-  if (!(region in CELLS)) return null;
+  const visible = value.webcam ?? value.visible ?? value.has_webcam ?? value.facecam;
+  // Models answer booleans as strings often enough that a bare `!== true` used
+  // to discard real detections.
+  if (visible !== true && visible !== "true" && visible !== "yes") return null;
+  const region = canonicalRegion(value.region ?? value.position ?? value.corner);
+  if (!region) return null;
   // A confident-sounding guess is not a detection; below 55 we keep the normal
   // layout rather than crop a random corner.
   const confidence = Number(value.confidence);
@@ -109,7 +197,7 @@ export function hintFromText(text: string): WebcamHint | null {
   const vertical = /\b(top|upper)\b/.test(lower)
     ? "top"
     : /\b(mid|middle|center|centre)\b/.test(lower)
-      ? "mid"
+      ? "middle"
       : /\b(bottom|lower)\b/.test(lower)
         ? "bottom"
         : null;
@@ -120,14 +208,19 @@ export function hintFromText(text: string): WebcamHint | null {
       : /\b(center|centre|middle)\b/.test(lower)
         ? "center"
         : null;
-  if (!vertical || !horizontal) return null;
+  // "on the left" with no height named is the common half-left, half-middle
+  // placement: treat it as the middle row rather than giving up.
+  const region = canonicalRegion(
+    vertical && horizontal ? `${vertical} ${horizontal}` : (horizontal ?? ""),
+  );
+  if (!region) return null;
 
   const size = /\b(large|big|huge)\b/.test(lower)
     ? "large"
     : /\b(small|tiny|little)\b/.test(lower)
       ? "small"
       : "medium";
-  return normaliseHint({ webcam: true, region: `${vertical}-${horizontal}`, size });
+  return normaliseHint({ webcam: true, region, size });
 }
 
 export function storedWebcam(hint: WebcamHint, box: WebcamBox): string {

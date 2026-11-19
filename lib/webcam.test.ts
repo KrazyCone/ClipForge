@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   boxFromHint,
+  canonicalRegion,
   hintFromText,
   normaliseHint,
   parseWebcamBox,
   storedWebcam,
+  WEBCAM_REGION_OPTIONS,
 } from "./webcam.ts";
 
 test("a bottom-left face cam maps inside the frame", () => {
@@ -35,7 +37,8 @@ test("no webcam or an unknown region yields no crop", () => {
 
 test("model output is validated, not trusted", () => {
   assert.equal(normaliseHint(null), null);
-  assert.equal(normaliseHint({ webcam: "yes", region: "bottom-left" }), null);
+  assert.equal(normaliseHint({ webcam: "no", region: "bottom-left" }), null);
+  assert.equal(normaliseHint({ webcam: false, region: "bottom-left" }), null);
   assert.deepEqual(normaliseHint({ webcam: true, region: "TOP-RIGHT", size: "huge" }), {
     visible: true,
     region: "top-right",
@@ -56,6 +59,35 @@ test("prose answers are recovered when the model skips JSON", () => {
   });
   assert.equal(hintFromText("No webcam visible in this frame."), null);
   assert.equal(hintFromText("The player is in the middle of the map."), null);
+});
+
+test("the middle row is offered and every spelling maps onto it", () => {
+  const values = WEBCAM_REGION_OPTIONS.map((option) => option.value);
+  assert.ok(values.includes("mid-left"));
+  assert.ok(values.includes("mid-right"));
+  assert.equal(values.length, 9);
+
+  for (const spelling of ["middle left", "left-middle", "center left", "left side", "left"]) {
+    assert.equal(canonicalRegion(spelling), "mid-left", spelling);
+  }
+  for (const spelling of ["middle right", "right-middle", "centre right", "right side", "right"]) {
+    assert.equal(canonicalRegion(spelling), "mid-right", spelling);
+  }
+  assert.equal(canonicalRegion("bottom left corner"), "bottom-left");
+  assert.equal(canonicalRegion("upper right"), "top-right");
+});
+
+test("a half-left webcam is detected without naming the height", () => {
+  assert.deepEqual(hintFromText("The face cam sits on the left side of the frame."), {
+    visible: true,
+    region: "mid-left",
+    size: "medium",
+  });
+  assert.deepEqual(normaliseHint({ webcam: "true", region: "middle left", size: "large" }), {
+    visible: true,
+    region: "mid-left",
+    size: "large",
+  });
 });
 
 test("stored boxes round-trip and malformed ones are rejected", () => {

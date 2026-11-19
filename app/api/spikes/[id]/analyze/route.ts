@@ -87,9 +87,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     // A rebuild keeps the clip row, so its own title must not count as taken.
     const existing = await d
-      .prepare("SELECT id FROM clips WHERE spike_id = ?")
+      .prepare("SELECT id, webcam_json FROM clips WHERE spike_id = ?")
       .bind(id)
-      .first<{ id: string }>();
+      .first<{ id: string; webcam_json: string | null }>();
     const titleRows =
       (
         await d
@@ -152,16 +152,23 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       webcamJson = null;
     } else if (manualHint && manualBox) {
       webcamJson = storedWebcam(manualHint, manualBox);
-    } else if (settings.webcamFocus && frames.length > 0) {
+    } else if (frames.length > 0) {
       const context = `Game: ${channel?.game_name ?? "unknown"}. Channel: ${channel?.display_name ?? spike.channel_login}.`;
-      // A late frame gives the model a second chance when the first is a
-      // fullscreen scene that happens to hide the cam.
-      let hint = await detectWebcam(e, frames[0], context);
-      if (!hint && frames.length > 1) {
-        hint = await detectWebcam(e, frames[frames.length - 1], context);
+      // Detection runs even when enlargement is switched off, so the clip keeps
+      // the placement for later. Every sampled frame gets a chance: one frame
+      // can be a fullscreen cutscene that hides the cam entirely.
+      let hint: WebcamHint | null = null;
+      for (const frame of frames.slice(0, 3)) {
+        hint = await detectWebcam(e, frame, context);
+        if (hint) break;
       }
       const box = boxFromHint(hint);
       if (hint && box) webcamJson = storedWebcam(hint, box);
+    }
+    // A re-cut whose detection failed must not throw away a placement the clip
+    // already had; without this, reprocessing could remove the enlargement.
+    if (!webcamJson && manualRegion !== "none") {
+      webcamJson = existing?.webcam_json ?? null;
     }
 
     // --- audio transcription --------------------------------------------

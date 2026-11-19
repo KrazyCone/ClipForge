@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { log } from "./config.js";
 import type { WebcamBox } from "./webcam.js";
 
 /**
@@ -167,6 +168,68 @@ export function ffprobeStreamStarts(
   });
 }
 
+/**
+ * How long the picture at `startSec` stays on one identical frame before it
+ * moves. A live snapshot can begin with a short stall - the same decoded frame
+ * repeated while its audio runs on - and a player then shows one frozen image
+ * for that whole moment even though the sound is fine.
+ *
+ * Small greyscale frames keep this cheap: about a second and a half of decode
+ * at 10 fps, no encoding. Any pixel changing by more than a few levels counts
+ * as motion, which a genuine freeze (bit-identical frames) never does.
+ */
+export async function frozenLeadSec(input: string, startSec: number, maxSec = 2): Promise<number> {
+  const fps = 10;
+  const width = 96;
+  const height = 54;
+  const frameBytes = width * height;
+  const motion = 4;
+
+  try {
+    const raw = await ffmpegBuffer(
+      [
+        "-hide_banner", "-loglevel", "error",
+        "-ss", Math.max(0, startSec).toFixed(3),
+        "-t", maxSec.toFixed(2),
+        "-i", input,
+        "-an",
+        "-vf", `fps=${fps},scale=${width}:${height}:flags=fast_bilinear,format=gray`,
+        "-f", "rawvideo",
+        "pipe:1",
+      ],
+      30_000,
+    );
+
+    const frames = Math.floor(raw.length / frameBytes);
+    if (frames < 3) return 0;
+    const first = raw.subarray(0, frameBytes);
+
+    let moving = -1;
+    for (let i = 1; i < frames && moving < 0; i++) {
+      const frame = raw.subarray(i * frameBytes, (i + 1) * frameBytes);
+      for (let p = 0; p < frameBytes; p++) {
+        if (Math.abs(frame[p] - first[p]) >= motion) {
+          moving = i;
+          break;
+        }
+      }
+    }
+    // Still at the end of the probe: the whole opening is a hold, so there is
+    // no later frame to start on and the cut is left where it is.
+    if (moving < 1) return 0;
+    const offset = moving / fps;
+    return offset >= 0.15 ? Math.min(offset, maxSec - 0.1) : 0;
+  } catch (err) {
+    // A source this build cannot decode is not a reason to fail the render; it
+    // just starts where it was planned to. The log line is how the operator can
+    // tell the probe never ran.
+    log(
+      `frozen-start probe skipped: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`,
+    );
+    return 0;
+  }
+}
+
 /** Audio and video durations of a finished file, for sync verification. */
 export function ffprobeStreamDurations(
   file: string,
@@ -318,26 +381,34 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     return;
   }
 
-  // A source can have one stream starting before the other (a live snapshot
-  // whose first segment carries audio first is the usual case). Left alone,
-  // the clip starts with audio-only time: the player holds the first frame
-  // while the audio runs. Trim the leading audio to the first video frame and
-  // trim both streams to the same length.
+  // A clip can open on a stretch of frozen picture while its audio runs on.
+  // Two things cause it: the container starts the video stream later than the
+  // audio, or the live snapshot simply repeats one frame for a moment. Both are
+  // measured here and skipped in the *video and the audio together*, so the cut
+  // begins on real motion with the sound still in step with it.
+  //
+  // Stream start offsets only describe the beginning of the file, so they are
+  // consulted only when the cut really is at the start; using them for a cut
+  // hundreds of seconds into a live buffer is what shifted some clips' audio.
   const durationStr = opts.durationSec.toFixed(3);
-  let audioLead = 0;
-  if (segments.length <= 1) {
-    const starts = await ffprobeStreamStarts(opts.input).catch(() => null);
-    if (starts) {
-      // Only a real gap, not encoder priming: anything longer than a frame or
-      // two means the picture genuinely starts later than the sound.
-      audioLead = Math.min(2, Math.max(0, starts.video - starts.audio));
-      if (audioLead < 0.08) audioLead = 0;
-    }
+  let leadSkip = 0;
+  const starts = await ffprobeStreamStarts(opts.input).catch(() => null);
+  if (starts && opts.startSec < 2) {
+    const gap = Math.min(2, Math.max(0, starts.video - starts.audio));
+    if (gap > 0.08) leadSkip = gap;
   }
+  leadSkip += await frozenLeadSec(opts.input, opts.startSec + leadSkip).catch(() => 0);
+  if (leadSkip > 0.05) {
+    log(`render starts ${leadSkip.toFixed(2)}s later: the source opens on a frozen picture`);
+  }
+
   const normalisedVideo = `setpts=PTS-STARTPTS,fps=30,trim=duration=${durationStr},setpts=PTS-STARTPTS`;
+  // No timestamp padding and no speed adaptation: both bend the audio away from
+  // the picture. The one audio stream is folded to stereo at a fixed rate so a
+  // 5.1 or mono source cannot come out warped.
   const normalisedAudio =
-    `asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,` +
-    `atrim=start=${audioLead.toFixed(3)},asetpts=PTS-STARTPTS,` +
+    `asetpts=PTS-STARTPTS,aresample=48000,` +
+    `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,` +
     `atrim=duration=${durationStr},asetpts=PTS-STARTPTS`;
 
   let filterComplex: string;
@@ -351,14 +422,15 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
   await ffmpeg([
     "-hide_banner",
     "-loglevel", "error",
-    "-ss", opts.startSec.toFixed(2),
-    // Extra read so the leading audio can be dropped without shortening the
-    // clip on sources whose video starts late.
-    "-t", (opts.durationSec + audioLead + 0.5).toFixed(2),
+    "-ss", (opts.startSec + leadSkip).toFixed(3),
+    // Extra read so the skipped lead does not shorten the clip.
+    "-t", (opts.durationSec + leadSkip + 0.5).toFixed(2),
     "-i", opts.input,
     "-filter_complex", filterComplex,
     "-map", "[v]",
-    "-map", "0:a?",
+    // Only the first audio track: mapping every track at once plays them on top
+    // of each other, which is another way a clip ends up sounding wrong.
+    "-map", "0:a:0?",
     "-af", normalisedAudio,
     "-c:v", "libx264",
     "-preset", "veryfast",
@@ -370,6 +442,7 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     "-c:a", "aac",
     "-b:a", "128k",
     "-ar", "48000",
+    "-ac", "2",
     "-movflags", "+faststart",
     "-y",
     opts.outPath,
@@ -420,9 +493,15 @@ async function renderJoined(
 ): Promise<void> {
   const hasAudio = await ffprobeHasAudio(opts.input);
   const args = ["-hide_banner", "-loglevel", "error"];
-  for (const segment of segments) {
+  // Only the opening cut can show the frozen start the player sees, and it
+  // keeps its planned length: the seek moves, the read window grows.
+  const lead = await frozenLeadSec(opts.input, segments[0].startSec).catch(() => 0);
+  const cuts = segments.map((segment, index) =>
+    index === 0 && lead > 0 ? { ...segment, startSec: segment.startSec + lead } : segment,
+  );
+  for (const segment of cuts) {
     args.push(
-      "-ss", Math.max(0, segment.startSec).toFixed(2),
+      "-ss", Math.max(0, segment.startSec).toFixed(3),
       // Read one second of slack and trim in the graph instead. `-t` on the
       // input stops at a packet boundary, so each cut's audio could run a frame
       // or two longer than its video and every join moved the audio later.
@@ -435,8 +514,8 @@ async function renderJoined(
   // with timestamps starting at zero. 1080p keeps the 9:16 foreground sharp.
   const chains: string[] = [];
   const pairLabels: string[] = [];
-  for (let i = 0; i < segments.length; i++) {
-    const duration = segments[i].durationSec.toFixed(3);
+  for (let i = 0; i < cuts.length; i++) {
+    const duration = cuts[i].durationSec.toFixed(3);
     chains.push(
       `[${i}:v]setpts=PTS-STARTPTS,fps=30,trim=duration=${duration},setpts=PTS-STARTPTS,` +
         `scale=1920:1080:force_original_aspect_ratio=decrease,` +
@@ -445,9 +524,9 @@ async function renderJoined(
     pairLabels.push(`[v${i}]`);
     if (hasAudio) {
       chains.push(
-        `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0,` +
+        `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000,` +
           `atrim=duration=${duration},asetpts=PTS-STARTPTS,` +
-          `aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`,
+          `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`,
       );
       pairLabels.push(`[a${i}]`);
     }
@@ -455,8 +534,8 @@ async function renderJoined(
   // One concat for both streams keeps their segment boundaries identical.
   chains.push(
     hasAudio
-      ? `${pairLabels.join("")}concat=n=${segments.length}:v=1:a=1[vc][ac]`
-      : `${pairLabels.join("")}concat=n=${segments.length}:v=1:a=0[vc]`,
+      ? `${pairLabels.join("")}concat=n=${cuts.length}:v=1:a=1[vc][ac]`
+      : `${pairLabels.join("")}concat=n=${cuts.length}:v=1:a=0[vc]`,
   );
 
   if (webcam) {
@@ -477,7 +556,7 @@ async function renderJoined(
     "-pix_fmt", "yuv420p",
     "-r", "30",
   );
-  if (hasAudio) args.push("-c:a", "aac", "-b:a", "128k", "-ar", "48000");
+  if (hasAudio) args.push("-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2");
   args.push("-movflags", "+faststart", "-y", opts.outPath);
   await ffmpeg(args, opts.timeoutMs ?? 300_000);
 }
