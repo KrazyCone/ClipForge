@@ -54,11 +54,13 @@ jobs:
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
         run: node dist/agent/src/renderer.js
 
-      # The schedule trigger never fires here either, so each run waits out the
-      # ten minute interval and queues the next one.
+      # The schedule trigger never fires here either, so each run waits out a
+      # short interval and queues the next one. Four minutes instead of ten
+      # halves how long a re-cut sits in the queue without costing extra runner
+      # minutes: the loop is continuous either way.
       - name: Wait out the render interval
         if: always() && steps.build.outcome == 'success'
-        run: sleep 540
+        run: sleep 240
 
       - name: Queue the next render run
         if: always() && steps.build.outcome == 'success'

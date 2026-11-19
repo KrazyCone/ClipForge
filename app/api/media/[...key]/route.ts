@@ -30,8 +30,10 @@ export async function GET(req: Request, ctx: { params: Promise<{ key: string[] }
     const headers = new Headers({
       "content-type": head.httpMetadata?.contentType ?? "application/octet-stream",
       "accept-ranges": "bytes",
-      // The route is gated per user, so a shared cache must never hold it.
-      "cache-control": "private, max-age=3600",
+      // The route is gated per user, so a shared cache must never hold it. It
+      // revalidates on every play as well: a re-rendered clip must not be
+      // served from a stale entry, or the old cut keeps playing.
+      "cache-control": "private, max-age=0, must-revalidate",
       etag: head.httpEtag ?? "",
     });
 

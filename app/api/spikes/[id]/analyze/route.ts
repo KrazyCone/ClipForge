@@ -9,7 +9,7 @@ import {
 } from "@/lib/ai";
 import { boxFromHint, storedWebcam, type WebcamHint } from "@/lib/webcam";
 import { pollSignals } from "@/lib/poll";
-import { uniqueTitle } from "@/lib/titles";
+import { uniqueCaption, uniqueTitle } from "@/lib/titles";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -90,16 +90,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .prepare("SELECT id, webcam_json FROM clips WHERE spike_id = ?")
       .bind(id)
       .first<{ id: string; webcam_json: string | null }>();
-    const titleRows =
+    // Titles and captions are both checked against the store: two clips can be
+    // different moments and still look like the same upload if they share copy.
+    const copyRows =
       (
         await d
-          .prepare("SELECT id, title FROM clips ORDER BY created_at DESC LIMIT 400")
-          .all<{ id: string; title: string | null }>()
+          .prepare("SELECT id, title, caption FROM clips ORDER BY created_at DESC LIMIT 1000")
+          .all<{ id: string; title: string | null; caption: string | null }>()
       ).results ?? [];
-    const takenTitles = titleRows
-      .filter((row) => row.id !== existing?.id)
-      .map((row) => row.title ?? "")
-      .filter(Boolean);
+    const elsewhere = copyRows.filter((row) => row.id !== existing?.id);
+    const takenTitles = elsewhere.map((row) => row.title ?? "").filter(Boolean);
+    const takenCaptions = elsewhere.map((row) => row.caption ?? "").filter(Boolean);
 
     const body = (await readJson<AnalyzeBody>(req)) ?? {};
 
@@ -342,6 +343,13 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     analysis.title = uniqueTitle(analysis.title, takenTitles, [
       `${analysis.title} — ${channel?.game_name ?? analysis.category}`,
       `${analysis.title} — ${analysis.category}`,
+      `${analysis.title} · ${channel?.display_name ?? spike.channel_login}`,
+    ]);
+    // The caption has to be its own line of copy: not the title, not another
+    // clip's caption.
+    analysis.caption = uniqueCaption(analysis.caption, takenCaptions, analysis.title, [
+      `${analysis.caption} — ${channel?.game_name ?? analysis.category}`.slice(0, 90).toUpperCase(),
+      `${analysis.caption} — ${channel?.display_name ?? spike.channel_login}`.slice(0, 90).toUpperCase(),
     ]);
 
     const assembledSec = beats.reduce((sum, b) => sum + (b.endSec - b.startSec), 0);

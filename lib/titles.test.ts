@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { uniqueTitle, uniqueTitleChanges } from "./titles.ts";
+import { uniqueCaption, uniqueTitle, uniqueTitleChanges } from "./titles.ts";
 
 test("an unused title is left alone", () => {
   assert.equal(uniqueTitle("Insane clutch", ["Other title"]), "Insane clutch");
@@ -37,4 +37,34 @@ test("changes rename only the later duplicates", () => {
 
 test("blank titles get a real one", () => {
   assert.equal(uniqueTitle("", []), "Twitch moment");
+});
+
+test("an unused caption is left alone", () => {
+  assert.equal(uniqueCaption("BRO REALLY DID THAT", ["OTHER CAPTION"], "Some title"), "BRO REALLY DID THAT");
+});
+
+test("a caption may not repeat another clip's caption", () => {
+  assert.equal(uniqueCaption("BRO REALLY DID THAT", ["bro really did that"], "Other"), "BRO REALLY DID THAT #2");
+});
+
+test("a caption may not be its own title", () => {
+  assert.equal(
+    uniqueCaption("That went badly", [], "That went badly", ["THAT WENT BADLY — MINECRAFT"]),
+    "THAT WENT BADLY — MINECRAFT",
+  );
+});
+
+test("every clip gets distinct copy from the same source phrases", () => {
+  const titles: string[] = [];
+  const captions: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const title = uniqueTitle("Insane clutch", titles);
+    titles.push(title);
+    captions.push(uniqueCaption("BRO REALLY DID THAT", captions, title));
+  }
+  assert.equal(new Set(titles).size, titles.length);
+  assert.equal(new Set(captions.map((c) => c.toLowerCase())).size, captions.length);
+  for (let i = 0; i < 6; i++) {
+    assert.notEqual(captions[i].trim().toLowerCase(), titles[i].trim().toLowerCase());
+  }
 });

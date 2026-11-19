@@ -17,6 +17,10 @@ export interface Env {
   APP_ORIGIN?: string;
   FREEBUFF_CLIENT_ID?: string;
   FREEBUFF_ISSUER?: string;
+  /** optional: lets a re-cut start a renderer run instead of waiting for one */
+  GITHUB_DISPATCH_TOKEN?: string;
+  GITHUB_REPOSITORY?: string;
+  GITHUB_DISPATCH_REF?: string;
 }
 
 export async function env(): Promise<Env> {

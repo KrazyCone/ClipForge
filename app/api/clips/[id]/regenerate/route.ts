@@ -1,6 +1,7 @@
 import { db, env, getSettings } from "@/lib/db";
-import { regenerateCaption } from "@/lib/ai";
+import { regenerateCopy } from "@/lib/ai";
 import type { MomentInput } from "@/lib/ai";
+import { uniqueCaption, uniqueTitle } from "@/lib/titles";
 import type { SpikeFeatures } from "@/lib/spike";
 import { json } from "@/lib/api";
 import type { Clip, Spike } from "@/lib/types";
@@ -55,19 +56,44 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
 
     const e = await env();
     const settings = await getSettings();
-    const { caption, provider } = await regenerateCaption(
+
+    // Everything this clip must not repeat: other clips' copy. Its own current
+    // title and caption are passed as the "previous" pair instead.
+    const rows =
+      (
+        await d
+          .prepare("SELECT id, title, caption FROM clips WHERE id != ? ORDER BY created_at DESC LIMIT 1000")
+          .bind(id)
+          .all<{ id: string; title: string | null; caption: string | null }>()
+      ).results ?? [];
+    const takenTitles = rows.map((row) => row.title ?? "").filter(Boolean);
+    const takenCaptions = rows.map((row) => row.caption ?? "").filter(Boolean);
+
+    const generated = await regenerateCopy(
       e,
       input,
-      clip.caption ?? "",
-      settings.clipDirection,
+      { title: clip.title ?? "", caption: clip.caption ?? "" },
+      {
+        avoidTitles: takenTitles,
+        avoidCaptions: takenCaptions,
+        direction: settings.clipDirection,
+      },
     );
 
+    // The model is asked to be original; these two are the guarantee.
+    const title = uniqueTitle(generated.title, takenTitles, [
+      `${generated.title} — ${clip.game_name ?? clip.channel_name ?? "twitch"}`,
+    ]);
+    const caption = uniqueCaption(generated.caption, takenCaptions, title, [
+      `${generated.caption} — ${clip.game_name ?? clip.channel_name ?? "LIVE"}`.slice(0, 90),
+    ]);
+
     await d
-      .prepare("UPDATE clips SET caption = ?, updated_at = ? WHERE id = ?")
-      .bind(caption, new Date().toISOString(), id)
+      .prepare("UPDATE clips SET title = ?, caption = ?, updated_at = ? WHERE id = ?")
+      .bind(title, caption, new Date().toISOString(), id)
       .run();
 
-    return json({ caption, provider });
+    return json({ title, caption, provider: generated.provider });
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }

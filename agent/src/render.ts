@@ -20,8 +20,8 @@ import type {
   TimedCaption,
 } from "./api.js";
 import type { TwitchVod } from "./twitch.js";
-import { audioLoudness, extractAudio, sampleFrames, thumbnail } from "./ffmpeg.js";
-import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
+import { audioLoudness, extractAudio, planLeadSkip, sampleFrames, thumbnail } from "./ffmpeg.js";
+import { buildAss, buildAssTimed, buildCaptionAss, shiftCaptions } from "./subtitles.js";
 import { describeWebcam, parseWebcamBox } from "./webcam.js";
 import { renderWithFallback } from "./produce.js";
 
@@ -174,8 +174,17 @@ async function renderClipJob(
   const transcript = clip.transcript ?? "";
 
   const assPath = path.join(workDir, "subs.ass");
-  const ass = captions.length
-    ? buildAssTimed(captions, duration, settings.subtitleStyle)
+  // Measure the frozen opening before the subtitle file exists: the render
+  // skips it from picture and audio together, so the cards must move by the
+  // same amount or they run ahead of the footage.
+  const lead = await planLeadSkip(playlist, start, joined ? cuts : undefined);
+  const leadSkip = joined ? lead.firstCut : lead.single;
+  if (leadSkip > 0.05) {
+    log(`clip ${clip.id}: skipping ${leadSkip.toFixed(2)}s of frozen opening - subtitles shifted with it`);
+  }
+  const timed = captions.length ? shiftCaptions(captions, leadSkip) : [];
+  const ass = timed.length
+    ? buildAssTimed(timed, duration, settings.subtitleStyle)
     : transcript && !joined
       ? buildAss(transcript, duration, settings.subtitleStyle)
       : buildCaptionAss(clip.caption ?? clip.title ?? "", duration);
@@ -194,6 +203,7 @@ async function renderClipJob(
       segments: joined ? cuts : undefined,
       outPath,
       assPath,
+      leadSkip,
       aspect: settings.aspectRatio,
       cropMode: "blur",
       webcam: parseWebcamBox(clip.webcam_json),

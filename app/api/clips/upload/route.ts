@@ -30,18 +30,28 @@ export async function POST(req: Request) {
     if (!clip) return json({ error: "clip not found" }, 404);
 
     const store = await files();
-    const mp4Key = `clips/${clipId}.mp4`;
+    // A new key per render. Browsers cache the media URL, so re-uploading a
+    // re-cut under the same path left the old file (and the old frozen first
+    // frame) playing until the cache expired. Previous objects are removed so
+    // the bucket does not fill up with superseded renders.
+    const stamp = Date.now().toString(36);
+    const mp4Key = `clips/${clipId}-${stamp}.mp4`;
     await store.put(mp4Key, await file.arrayBuffer(), {
       httpMetadata: { contentType: "video/mp4", cacheControl: "public, max-age=31536000" },
     });
 
     let thumbKey: string | null = null;
     if (thumb instanceof File && thumb.size > 0) {
-      thumbKey = `clips/${clipId}.jpg`;
+      thumbKey = `clips/${clipId}-${stamp}.jpg`;
       await store.put(thumbKey, await thumb.arrayBuffer(), {
         httpMetadata: { contentType: "image/jpeg", cacheControl: "public, max-age=31536000" },
       });
     }
+
+    const stale = [clip.r2_key, clip.thumb_key].filter(
+      (key): key is string => typeof key === "string" && key.length > 0 && !key.includes(`-${stamp}.`),
+    );
+    if (stale.length) await store.delete(stale).catch(() => {});
 
     const meta = JSON.parse(String(form.get("meta") ?? "{}")) as {
       durationMs?: number;

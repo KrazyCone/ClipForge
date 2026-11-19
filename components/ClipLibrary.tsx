@@ -208,7 +208,7 @@ export function ClipLibrary({
           ? "Queued — a longer re-cut is on its way"
           : options.needsContext
             ? "Queued — the re-cut will include the setup"
-            : "Queued — the collector re-cuts this clip on its next pass",
+            : "Queued — the re-cut starts on the next renderer pass",
       );
       await load(sort === "taste" ? "newest" : sort);
     } else {
@@ -250,11 +250,19 @@ export function ClipLibrary({
   async function regenerate(clip: Clip) {
     setBusy(clip.id);
     const res = await fetch(`/api/clips/${clip.id}/regenerate`, { method: "POST" });
-    const data = (await res.json()) as { caption?: string; provider?: string; error?: string };
-    if (res.ok && data.caption) {
-      setClips((prev) => prev.map((c) => (c.id === clip.id ? { ...c, caption: data.caption! } : c)));
-      setOpen((prev) => (prev && prev.id === clip.id ? { ...prev, caption: data.caption! } : prev));
-      setToast(`New caption via ${data.provider === "heuristic" ? "local generator" : "Workers AI"}`);
+    const data = (await res.json()) as {
+      title?: string;
+      caption?: string;
+      provider?: string;
+      error?: string;
+    };
+    if (res.ok && data.title && data.caption) {
+      const next = { title: data.title, caption: data.caption };
+      setClips((prev) => prev.map((c) => (c.id === clip.id ? { ...c, ...next } : c)));
+      setOpen((prev) => (prev && prev.id === clip.id ? { ...prev, ...next } : prev));
+      setToast(
+        `New title and caption via ${data.provider === "heuristic" ? "local generator" : "Workers AI"}`,
+      );
     } else {
       setToast(data.error ?? "Could not regenerate");
     }
@@ -445,7 +453,7 @@ export function ClipLibrary({
                     ) : null}
                     <button
                       className="btn sm ghost icon"
-                      title="Regenerate caption"
+                      title="Regenerate title and caption"
                       disabled={busy === clip.id}
                       onClick={() => regenerate(clip)}
                     >
@@ -554,6 +562,12 @@ function ClipModal({
   const [title, setTitle] = useState(clip.title ?? "");
   const [caption, setCaption] = useState(clip.caption ?? "");
   const [copied, setCopied] = useState(false);
+  // A regenerate (or a refresh) replaces the clip's copy while the modal stays
+  // open, so the fields follow the stored values instead of going stale.
+  useEffect(() => {
+    setTitle(clip.title ?? "");
+    setCaption(clip.caption ?? "");
+  }, [clip.id, clip.title, clip.caption]);
   const [needsContext, setNeedsContext] = useState(false);
   const [webcamRegion, setWebcamRegion] = useState("auto");
 
@@ -797,7 +811,7 @@ function ClipModal({
               {copied ? "Copied" : "Copy caption"}
             </button>
             <button className="btn sm" disabled={busy} onClick={onRegenerate}>
-              <IconSparkle width={12} height={12} /> New caption
+              <IconSparkle width={12} height={12} /> New title &amp; caption
             </button>
             {clip.status === "ready" ? (
               <a className="btn sm" href={`/api/clips/${clip.id}/download`}>

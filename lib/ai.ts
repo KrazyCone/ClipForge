@@ -679,6 +679,88 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
   }
 }
 
+/**
+ * A fresh title and caption for one clip. The two are generated together so
+ * they describe the same moment without repeating each other; the differences
+ * from every other clip are enforced by the caller with lib/titles.
+ */
+export async function regenerateCopy(
+  e: Env,
+  input: MomentInput,
+  previous: { title: string; caption: string },
+  options: { avoidTitles?: string[]; avoidCaptions?: string[]; direction?: string } = {},
+): Promise<{ title: string; caption: string; provider: string }> {
+  const base = heuristicAnalysis(input);
+  const rotate = (list: string[], current: string): string => {
+    const fresh = list.filter(
+      (value) => value.trim().toLowerCase() !== current.trim().toLowerCase(),
+    );
+    const pool = fresh.length ? fresh : list;
+    return pool[Math.floor(Math.random() * pool.length)] ?? list[0];
+  };
+  const heuristic = {
+    title: rotate(heuristicTitles(input, base.category), previous.title),
+    caption: rotate(heuristicCaptions(input, base.category), previous.caption),
+  };
+  if (!aiConfigured(e)) return { ...heuristic, provider: "heuristic" };
+
+  const model = e.AI_MODEL || DEFAULT_AI_MODEL;
+  try {
+    const json = (await runModel(e, model, {
+      messages: [
+        {
+          role: "system",
+          content:
+            "Write the title and caption for one Twitch clip. Reply with JSON only, no prose: " +
+            '{"title":"...","caption":"..."}. ' +
+            "The title is 3-9 words, sentence case, specific to what happened in the video. " +
+            "The caption is a different phrase from the title - a punchline or reaction line, ALL CAPS, under 60 characters. " +
+            "No hashtags, no quotes, no emoji spam. Never mention chat, viewers or donations. " +
+            "Do not reuse or lightly reword the previous title or caption, or any title in the used list." +
+            captionDirectionSuffix(options.direction ?? ""),
+        },
+        {
+          role: "user",
+          content: [
+            `Channel ${input.channelName}, game ${input.gameName ?? "unknown"}.`,
+            `What happened: ${input.summary ?? "a notable moment on stream"}.`,
+            `Previous title (do not repeat): ${previous.title}`,
+            `Previous caption (do not repeat): ${previous.caption}`,
+            options.avoidTitles?.length
+              ? `Titles already used:\n${options.avoidTitles.slice(0, 30).join("\n")}`
+              : "",
+            options.avoidCaptions?.length
+              ? `Captions already used:\n${options.avoidCaptions.slice(0, 30).join("\n")}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        },
+      ],
+      max_tokens: 140,
+      temperature: 0.95,
+    })) as { result?: { response?: string } };
+    const parsed = safeParse(json.result?.response ?? "");
+    const title = String(parsed?.title ?? "")
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .slice(0, 90);
+    const caption = String(parsed?.caption ?? "")
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .slice(0, 80)
+      .toUpperCase();
+    if (!title && !caption) return { ...heuristic, provider: "heuristic" };
+    return {
+      title: title || heuristic.title,
+      caption: caption || heuristic.caption,
+      provider: "workers-ai",
+    };
+  } catch {
+    return { ...heuristic, provider: "heuristic" };
+  }
+}
+
 export async function regenerateCaption(
   e: Env,
   input: MomentInput,

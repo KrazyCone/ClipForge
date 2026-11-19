@@ -28,6 +28,32 @@ export function uniqueTitle(base: string, taken: string[], variants: string[] = 
   return `${clean} (${Date.now().toString(36).slice(-4)})`.slice(0, 90);
 }
 
+/**
+ * Captions land on the card and get pasted into a post, so two clips sharing
+ * one look like a duplicate upload. A caption must also never be its own
+ * title; both are checked here against everything already stored.
+ */
+export function uniqueCaption(
+  base: string,
+  taken: string[],
+  title = "",
+  variants: string[] = [],
+): string {
+  const clean = (base ?? "").trim().replace(/\s+/g, " ").slice(0, 90) || "TWITCH CLIP";
+  const seen = new Set([...taken, title].map(normalise).filter(Boolean));
+  if (!seen.has(normalise(clean))) return clean;
+
+  const attempts = [
+    ...variants,
+    ...Array.from({ length: 9 }, (_, index) => `${clean} #${index + 2}`),
+  ];
+  for (const raw of attempts) {
+    const candidate = String(raw ?? "").trim().replace(/\s+/g, " ").slice(0, 90);
+    if (candidate && !seen.has(normalise(candidate))) return candidate;
+  }
+  return `${clean} #${Date.now().toString(36).slice(-4)}`.slice(0, 90);
+}
+
 export interface TitleRow {
   id: string;
   title: string | null;

@@ -4,6 +4,7 @@ import { denied } from "@/lib/guard";
 import { getAllFeedback } from "@/lib/queries";
 import { summariseFeedback } from "@/lib/feedback";
 import { WEBCAM_REGIONS } from "@/lib/webcam";
+import { nudgeRenderer } from "@/lib/workflow";
 import type { Clip } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -68,7 +69,16 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       .bind(JSON.stringify(patch), clip.spike_id)
       .run();
 
-    return json({ ok: true, queued: true, patch: Object.keys(patch).length ? patch : null });
+    // Ask for a renderer run now rather than leaving the re-cut to the next
+    // scheduled one; without a dispatch token this quietly does nothing.
+    const dispatched = await nudgeRenderer("clip rebuild");
+
+    return json({
+      ok: true,
+      queued: true,
+      dispatched,
+      patch: Object.keys(patch).length ? patch : null,
+    });
   } catch (err) {
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }

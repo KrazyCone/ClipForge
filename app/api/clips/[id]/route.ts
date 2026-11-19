@@ -1,4 +1,5 @@
 import { db, files } from "@/lib/db";
+import { nudgeRenderer } from "@/lib/workflow";
 import { json, readJson } from "@/lib/api";
 import type { Clip } from "@/lib/types";
 import { denied } from "@/lib/guard";
@@ -39,7 +40,9 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       if (clip.spike_id) {
         await d.prepare("UPDATE spikes SET status = 'rendering' WHERE id = ?").bind(clip.spike_id).run();
       }
-      return json({ ok: true, queued: true });
+      // Start a renderer run now instead of waiting for the next scheduled one.
+      const dispatched = await nudgeRenderer("clip reprocess");
+      return json({ ok: true, queued: true, dispatched });
     } catch (err) {
       return json({ error: String(err) }, 500);
     }

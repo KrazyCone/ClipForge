@@ -230,6 +230,43 @@ export async function frozenLeadSec(input: string, startSec: number, maxSec = 2)
   }
 }
 
+export interface LeadSkipPlan {
+  /** seconds to skip at the start of a single cut */
+  single: number;
+  /** seconds to skip at the head of a joined clip (the first cut only) */
+  firstCut: number;
+}
+
+/**
+ * Measures how much frozen picture a render will skip. The caller needs this
+ * *before* it writes the subtitle file, so the same number shifts both the
+ * captions and the picture; otherwise the subtitles run ahead of the footage by
+ * exactly the amount that was skipped.
+ */
+export async function planLeadSkip(
+  input: string,
+  startSec: number,
+  segments?: { startSec: number; durationSec: number }[],
+): Promise<LeadSkipPlan> {
+  const cuts = (segments ?? []).filter((s) => s.durationSec >= 1);
+  if (cuts.length > 1) {
+    const firstCut = await frozenLeadSec(input, Math.max(0, cuts[0].startSec)).catch(() => 0);
+    return { single: 0, firstCut };
+  }
+
+  // Stream start offsets only describe the beginning of the file, so they are
+  // consulted only when the cut really is at the start; using them for a cut
+  // hundreds of seconds into a live buffer is what shifted some clips' audio.
+  let single = 0;
+  const starts = await ffprobeStreamStarts(input).catch(() => null);
+  if (starts && startSec < 2) {
+    const gap = Math.min(2, Math.max(0, starts.video - starts.audio));
+    if (gap > 0.08) single = gap;
+  }
+  single += await frozenLeadSec(input, startSec + single).catch(() => 0);
+  return { single, firstCut: 0 };
+}
+
 /** Audio and video durations of a finished file, for sync verification. */
 export function ffprobeStreamDurations(
   file: string,
@@ -342,6 +379,12 @@ export interface RenderOptions {
   focusWebcam?: boolean;
   /** hard limit for a slow render; the webcam pass gets a tighter budget */
   timeoutMs?: number;
+  /**
+   * Frozen lead already measured by `planLeadSkip`. Supplying it keeps the
+   * picture and the subtitle file on the same skip; when omitted the render
+   * measures it itself.
+   */
+  leadSkip?: number;
 }
 
 /**
@@ -384,20 +427,13 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
   // A clip can open on a stretch of frozen picture while its audio runs on.
   // Two things cause it: the container starts the video stream later than the
   // audio, or the live snapshot simply repeats one frame for a moment. Both are
-  // measured here and skipped in the *video and the audio together*, so the cut
+  // measured and skipped in the *video and the audio together*, so the cut
   // begins on real motion with the sound still in step with it.
-  //
-  // Stream start offsets only describe the beginning of the file, so they are
-  // consulted only when the cut really is at the start; using them for a cut
-  // hundreds of seconds into a live buffer is what shifted some clips' audio.
   const durationStr = opts.durationSec.toFixed(3);
-  let leadSkip = 0;
-  const starts = await ffprobeStreamStarts(opts.input).catch(() => null);
-  if (starts && opts.startSec < 2) {
-    const gap = Math.min(2, Math.max(0, starts.video - starts.audio));
-    if (gap > 0.08) leadSkip = gap;
-  }
-  leadSkip += await frozenLeadSec(opts.input, opts.startSec + leadSkip).catch(() => 0);
+  const leadSkip =
+    opts.leadSkip !== undefined
+      ? Math.max(0, opts.leadSkip)
+      : (await planLeadSkip(opts.input, opts.startSec)).single;
   if (leadSkip > 0.05) {
     log(`render starts ${leadSkip.toFixed(2)}s later: the source opens on a frozen picture`);
   }
@@ -443,6 +479,12 @@ export async function renderClip(opts: RenderOptions): Promise<void> {
     "-b:a", "128k",
     "-ar", "48000",
     "-ac", "2",
+    // Browser-friendly start: a constant frame rate, no negative timestamps and
+    // the index at the front of the file, so a player has a real frame at t=0
+    // instead of holding the poster while it waits for one.
+    "-fps_mode", "cfr",
+    "-fflags", "+genpts",
+    "-avoid_negative_ts", "make_zero",
     "-movflags", "+faststart",
     "-y",
     opts.outPath,
@@ -494,8 +536,12 @@ async function renderJoined(
   const hasAudio = await ffprobeHasAudio(opts.input);
   const args = ["-hide_banner", "-loglevel", "error"];
   // Only the opening cut can show the frozen start the player sees, and it
-  // keeps its planned length: the seek moves, the read window grows.
-  const lead = await frozenLeadSec(opts.input, segments[0].startSec).catch(() => 0);
+  // keeps its planned length: the seek moves, the read window grows. The caller
+  // passes the lead it already measured so the subtitles were shifted by it.
+  const lead =
+    opts.leadSkip !== undefined
+      ? Math.max(0, opts.leadSkip)
+      : await frozenLeadSec(opts.input, segments[0].startSec).catch(() => 0);
   const cuts = segments.map((segment, index) =>
     index === 0 && lead > 0 ? { ...segment, startSec: segment.startSec + lead } : segment,
   );
@@ -557,7 +603,16 @@ async function renderJoined(
     "-r", "30",
   );
   if (hasAudio) args.push("-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2");
-  args.push("-movflags", "+faststart", "-y", opts.outPath);
+  // Same clean-start treatment as the single cut: constant frame rate, no
+  // negative timestamps, index first.
+  args.push(
+    "-fps_mode", "cfr",
+    "-fflags", "+genpts",
+    "-avoid_negative_ts", "make_zero",
+    "-movflags", "+faststart",
+    "-y",
+    opts.outPath,
+  );
   await ffmpeg(args, opts.timeoutMs ?? 300_000);
 }
 

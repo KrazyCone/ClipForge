@@ -118,6 +118,26 @@ export interface TimedCaption {
   text: string;
 }
 
+/**
+ * Moves caption cards earlier when the render skips a frozen opening. The
+ * skipped lead is cut from the timeline, so every card after it starts that
+ * much sooner; a card that only covered the skipped part is dropped and one
+ * that straddles the cut is clamped to zero.
+ */
+export function shiftCaptions(captions: TimedCaption[], shiftSec: number): TimedCaption[] {
+  if (!(shiftSec > 0.02)) return captions;
+  return captions
+    .map((caption) => ({
+      ...caption,
+      startSec: caption.startSec - shiftSec,
+      endSec: caption.endSec - shiftSec,
+    }))
+    // A card with almost nothing left after the skip is a flash of text with
+    // no speech behind it; drop it instead of clamping it to zero.
+    .filter((caption) => caption.endSec > 0.3)
+    .map((caption) => ({ ...caption, startSec: Math.max(0, caption.startSec) }));
+}
+
 /** Header block shared by the transcript and timed-card builders. */
 function headerFor(style: keyof typeof STYLES): string {
   const s = STYLES[style] ?? STYLES.bold;

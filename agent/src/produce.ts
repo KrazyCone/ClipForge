@@ -7,13 +7,14 @@ import path from "node:path";
 import {
   audioLoudness,
   ffprobeStreamDurations,
+  planLeadSkip,
   renderClip,
   thumbnail,
   extractAudio,
   sampleFrames,
   type RenderOptions,
 } from "./ffmpeg.js";
-import { buildAss, buildAssTimed, buildCaptionAss } from "./subtitles.js";
+import { buildAss, buildAssTimed, buildCaptionAss, shiftCaptions } from "./subtitles.js";
 import { describeWebcam, parseWebcamBox } from "./webcam.js";
 import type { AgentSettings, AnalyzeBeat, AnalyzeResult, QueueClip, TimedCaption } from "./api.js";
 import type { ClipforgeApi } from "./api.js";
@@ -98,11 +99,22 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
 
   const transcript = opts.transcript ?? "";
   const assPath = path.join(workDir, "subs.ass");
+  // The render may skip a frozen opening. Measure it now, before the subtitle
+  // file is written, so the cards move with the picture instead of running
+  // ahead of it. The same number is handed to the renderer below.
+  const lead = await planLeadSkip(sourceFile, startInSource, joined ? cuts : undefined);
+  const leadSkip = joined ? lead.firstCut : lead.single;
+  if (leadSkip > 0.05) {
+    log(
+      `live clip ${clip.id}: skipping ${leadSkip.toFixed(2)}s of frozen opening - subtitles shifted with it`,
+    );
+  }
   // Untimed text belongs to the whole analysed window, so it can only be
   // spread honestly over a single cut. A joined clip without timings gets the
   // caption card instead of subtitles that drift onto the wrong footage.
-  const ass = opts.captions?.length
-    ? buildAssTimed(opts.captions, duration, settings.subtitleStyle)
+  const timed = opts.captions?.length ? shiftCaptions(opts.captions, leadSkip) : [];
+  const ass = timed.length
+    ? buildAssTimed(timed, duration, settings.subtitleStyle)
     : transcript && !joined
       ? buildAss(transcript, duration, settings.subtitleStyle)
       : buildCaptionAss(clip.caption ?? clip.title ?? "", duration);
@@ -122,6 +134,7 @@ export async function produceClipFromFile(opts: ProduceOptions): Promise<number>
       segments: joined ? cuts : undefined,
       outPath,
       assPath,
+      leadSkip,
       aspect: settings.aspectRatio,
       cropMode: "blur",
       webcam: parseWebcamBox(clip.webcam_json),
