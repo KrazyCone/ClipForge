@@ -55,12 +55,19 @@ jobs:
         run: node dist/agent/src/renderer.js
 
       # The schedule trigger never fires here either, so each run waits out a
-      # short interval and queues the next one. Four minutes instead of ten
-      # halves how long a re-cut sits in the queue without costing extra runner
-      # minutes: the loop is continuous either way.
+      # short interval and queues the next one. The renderer asks for no wait at
+      # all when it actually had work, so a queued re-cut starts straight away
+      # instead of sitting behind a four minute sleep.
       - name: Wait out the render interval
         if: always() && steps.build.outcome == 'success'
-        run: sleep 240
+        run: |
+          delay="${NEXT_RUN_DELAY:-240}"
+          if [ "$delay" = "0" ]; then
+            echo "queue had work - queueing the next run immediately"
+          else
+            echo "idle - waiting ${delay}s before the next run"
+            sleep "$delay"
+          fi
 
       - name: Queue the next render run
         if: always() && steps.build.outcome == 'success'

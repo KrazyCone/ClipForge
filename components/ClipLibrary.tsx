@@ -798,7 +798,7 @@ function ClipModal({
           <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
             {clip.rebuild_pending
               ? "Queued — waiting for the collector. The current cut stays playable until the new one replaces it."
-              : "The re-cut uses these settings, the title and caption above, and what you wrote in Your take. Nothing is queued until you press Re-cut."}
+              : "The re-cut uses these settings, the title and caption above, and what you wrote in Your take. Nothing is queued until you press Re-cut. On a channel that is still live only the last ~15 minutes are buffered, so an older moment is cut once Twitch publishes the archive VOD."}
           </div>
           <div className="faint" style={{ fontSize: 10.5, lineHeight: 1.5 }}>
             {(() => {

@@ -109,6 +109,8 @@ export class Collector {
   private draining = false;
   /** Spikes that arrived while both live render slots were busy. */
   private pendingLive: { login: string; ts: number; spikeId: string }[] = [];
+  /** Re-cuts already reported as waiting for the archive VOD, so it logs once. */
+  private deferredRebuilds = new Set<string>();
   /** true while a detection pass is in flight, so slow networks cannot pile up runs */
   private detecting = false;
   /** unix seconds of the last moment detection actually emitted, for the heartbeat */
@@ -597,13 +599,15 @@ export class Collector {
 
   private bufferSeconds(): number {
     const settings = this.settings;
-    // Eight minutes beyond the clip window: a burst can put several moments
-    // behind two render slots, and a re-cut of a clip made a few minutes ago
-    // needs its source footage still on disk. At 1080p this is roughly a
-    // third of a gigabyte per channel on the runner's disk.
+    // A re-cut is the reason this is not just "a bit more than a clip": the
+    // moment being re-cut is usually a clip made several minutes ago, and while
+    // the stream is still live there is no archive VOD to fall back on. The
+    // extra 900s (about fifteen minutes of recent footage) is what lets most
+    // re-cuts be cut immediately instead of waiting for the stream to end. At
+    // 1080p that is roughly 0.9 GB per channel on the runner's disk.
     return Math.max(
       300,
-      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 480,
+      (settings?.preEventSec ?? 8) + (settings?.postEventSec ?? 10) + 900,
     );
   }
 
@@ -625,7 +629,19 @@ export class Collector {
       if (this.stopping) return;
       // Tail of the buffer is still being written; skip moments the recorder
       // cannot cover yet.
-      if (now - spike.ts_unix > window) continue;
+      if (now - spike.ts_unix > window) {
+        // Say why a re-cut is not happening now: an old moment on a live
+        // channel can only be cut once the archive VOD exists.
+        if (spike.analyze_json && !this.deferredRebuilds.has(spike.id)) {
+          if (this.deferredRebuilds.size > 500) this.deferredRebuilds.clear();
+          this.deferredRebuilds.add(spike.id);
+          log(
+            `rebuild ${spike.id}: moment is ${Math.round((now - spike.ts_unix) / 60)} min old and the ` +
+              `live buffer covers ${Math.round(window / 60)} min - waiting for the archive VOD`,
+          );
+        }
+        continue;
+      }
       // Only re-cuts: a fresh spike is already being handled by the detector.
       if (!spike.analyze_json) continue;
       const login = spike.channel_login.toLowerCase();

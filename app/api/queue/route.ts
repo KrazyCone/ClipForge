@@ -21,10 +21,12 @@ export async function GET(req: Request) {
     const [spikes, pendingClips] = await Promise.all([
       d
         .prepare(
+          // Re-cuts first: somebody asked for them, so they must not wait behind
+          // a backlog of freshly detected moments.
           `SELECT s.*, c.title AS stream_title, c.game_name, c.display_name, c.avatar_url, c.capture_mode
            FROM spikes s JOIN channels c ON c.id = s.channel_id
            WHERE s.status = 'queued' AND s.merged_into IS NULL
-           ORDER BY s.intensity DESC, s.ts_unix ASC LIMIT ?`,
+           ORDER BY (s.analyze_json IS NOT NULL) DESC, s.intensity DESC, s.ts_unix ASC LIMIT ?`,
         )
         .bind(limit)
         .all<Spike & { stream_title: string; game_name: string; display_name: string; avatar_url: string; capture_mode: string }>(),
