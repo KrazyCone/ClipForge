@@ -221,6 +221,38 @@ export function ClipLibrary({
     setBusy(null);
   }
 
+  /** Withdraw a re-cut that is still queued, before the renderer picks it up. */
+  async function cancelRebuild(clip: Clip) {
+    setBusy(clip.id);
+    const res = await fetch(`/api/clips/${clip.id}/rebuild`, { method: "DELETE" });
+    const data = (await res.json()) as {
+      ok?: boolean;
+      cancelled?: boolean;
+      alreadyRunning?: boolean;
+      error?: string;
+    };
+    if (res.ok) {
+      if (data.cancelled || !data.alreadyRunning) {
+        setClips((prev) =>
+          prev.map((c) => (c.id === clip.id ? { ...c, rebuild_pending: 0 } : c)),
+        );
+        setOpen((prev) =>
+          prev && prev.id === clip.id ? { ...prev, rebuild_pending: 0 } : prev,
+        );
+      }
+      setToast(
+        data.alreadyRunning
+          ? "Already being cut — the current render will finish"
+          : data.cancelled
+            ? "Re-cut cancelled — the current cut stays"
+            : "Nothing was queued for this clip",
+      );
+    } else {
+      setToast(data.error ?? "Could not cancel the re-cut");
+    }
+    setBusy(null);
+  }
+
   async function applySuggestion(patch: Partial<AppSettings>) {
     const res = await fetch("/api/settings", {
       method: "PUT",
@@ -513,6 +545,7 @@ export function ClipLibrary({
           suggestion={summary.suggestion}
           webcamFocus={current.webcamFocus}
           onRebuild={(options) => rebuild(open, options)}
+          onCancelRebuild={() => cancelRebuild(open)}
           onApplySuggestion={applySuggestion}
           onFeedback={(next) =>
             setFeedback((prev) => {
@@ -542,6 +575,7 @@ function ClipModal({
   onReprocess,
   onSave,
   onRebuild,
+  onCancelRebuild,
   onApplySuggestion,
   onFeedback,
 }: {
@@ -563,6 +597,7 @@ function ClipModal({
     caption?: string;
     direction?: string;
   }) => void;
+  onCancelRebuild: () => void;
   onApplySuggestion: (patch: Partial<AppSettings>) => void;
   onFeedback: (feedback: ClipFeedback | null) => void;
 }) {
@@ -703,6 +738,16 @@ function ClipModal({
               <IconRefresh width={12} height={12} />{" "}
               {clip.rebuild_pending ? "Re-cut queued" : "Re-cut with these settings"}
             </button>
+            {clip.rebuild_pending ? (
+              <button
+                className="btn sm"
+                disabled={busy}
+                title="Withdraw the queued re-cut and keep the current cut"
+                onClick={onCancelRebuild}
+              >
+                <IconX width={12} height={12} /> Cancel re-cut
+              </button>
+            ) : null}
             <button
               className="btn sm"
               disabled={!suggestion || busy}

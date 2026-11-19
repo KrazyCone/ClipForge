@@ -111,3 +111,44 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
+
+/**
+ * Cancels a queued re-cut. The request lives on the spike, so clearing it is
+ * enough: the next collector drain and renderer pass find nothing to re-cut and
+ * the current cut stays as it is. A re-cut the analyser has already picked up
+ * cannot be called back, and the response says so instead of pretending it
+ * stopped.
+ */
+export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const gate = await denied();
+  if (gate) return gate;
+  const { id } = await ctx.params;
+
+  try {
+    const d = await db();
+    const clip = await d.prepare("SELECT * FROM clips WHERE id = ?").bind(id).first<Clip>();
+    if (!clip) return json({ error: "clip not found" }, 404);
+    if (!clip.spike_id) return json({ error: "This clip has no queued re-cut." }, 400);
+
+    await ensureAnalyzeColumn(d);
+    const spike = await d
+      .prepare("SELECT status, analyze_json FROM spikes WHERE id = ?")
+      .bind(clip.spike_id)
+      .first<{ status: string; analyze_json: string | null }>();
+    if (!spike) return json({ error: "clip not found" }, 404);
+    if (!spike.analyze_json) return json({ ok: true, cancelled: false, alreadyRunning: false });
+
+    const running = spike.status === "analyzing" || spike.status === "rendering";
+    // Put the spike back where the clip actually is, so the queue stops
+    // reporting a moment as in flight once the request is gone.
+    const restored = running ? spike.status : clip.status === "ready" ? "done" : "rendering";
+    await d
+      .prepare("UPDATE spikes SET analyze_json = NULL, status = ? WHERE id = ?")
+      .bind(restored, clip.spike_id)
+      .run();
+
+    return json({ ok: true, cancelled: !running, alreadyRunning: running });
+  } catch (err) {
+    return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+}
