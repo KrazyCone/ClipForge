@@ -9,7 +9,8 @@ import {
 } from "@/lib/ai";
 import { boxFromHint, storedWebcam, type WebcamHint } from "@/lib/webcam";
 import { pollSignals } from "@/lib/poll";
-import { uniqueCaption, uniqueTitle } from "@/lib/titles";
+import { pickUnused, uniqueCaption, uniqueTitle } from "@/lib/titles";
+import { chatAdShare, chatLooksLikeAd, looksLikeAdFrame } from "@/lib/ads";
 import type { MomentBeat, MomentInput, SpokenSegment } from "@/lib/ai";
 import { isIngestAuthorized, json, readJson } from "@/lib/api";
 import type { SpikeFeatures } from "@/lib/spike";
@@ -126,6 +127,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
     // --- visual analysis -------------------------------------------------
     const visualNotes: string[] = [];
+    const frameNotes: string[] = [];
     let visionError: string | null = null;
     const frames = (body.frames ?? []).slice(0, MAX_FRAMES);
     for (const frame of frames) {
@@ -134,10 +136,34 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
         frame,
         `Describe what is happening on screen in this Twitch stream frame in one short sentence. ` +
           `Focus on: reactions, deaths/eliminations, victories, sudden scene changes, on-screen text. ` +
+          `Say so plainly if this is an advertisement, an ad countdown, a "stream will continue shortly" ` +
+          `screen or a technical pause instead of the stream. ` +
           `Game context: ${channel?.game_name ?? "unknown"}.`,
       );
-      if (result?.text) visualNotes.push(result.text.trim().slice(0, 300));
-      else if (result?.error && !visionError) visionError = result.error;
+      if (result?.text) {
+        const note = result.text.trim().slice(0, 300);
+        frameNotes.push(note);
+        visualNotes.push(note);
+      } else if (result?.error && !visionError) visionError = result.error;
+    }
+
+    // An ad break has every ingredient of a good moment - a chat burst, a loud
+    // cut - except anything happening on stream, so the clip is of the ad page.
+    // Both signals here are free: what the frames describe, and what chat says.
+    const adFrames = frameNotes.filter((note) => looksLikeAdFrame(note)).length;
+    const adChatShare = Math.round(chatAdShare(samples) * 100) / 100;
+    const adReason =
+      frameNotes.length > 0 && adFrames === frameNotes.length
+        ? "every sampled frame was an ad break, not the stream"
+        : chatLooksLikeAd(samples)
+          ? "chat was calling out an ad break"
+          : null;
+    if (adReason) {
+      await d
+        .prepare("UPDATE spikes SET ai_json = ?, status = 'skipped' WHERE id = ?")
+        .bind(JSON.stringify({ skipped: adReason, adFrames, adChatShare }), id)
+        .run();
+      return json({ ok: true, skipped: true, reason: adReason, adFrames, transcript: "" });
     }
 
     // --- webcam layout ---------------------------------------------------
@@ -359,12 +385,29 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       beats[0] = { ...beats[0], endSec: Math.min(windowEndSec, beats[0].startSec + 6) };
     }
 
-    // The model is told to avoid these, but the store is the guarantee.
-    analysis.title = uniqueTitle(analysis.title, takenTitles, [
+    // A used title used to become "the same phrase (2)" forever. The model's own
+    // three options and the line that was actually picked are tried first, so a
+    // clip is named after its own moment instead of a numbered copy.
+    const spokenLine = (analysis.funnySegmentIndices ?? [])
+      .map((index) => segments[index]?.text)
+      .find((text) => typeof text === "string" && text.trim().length > 8);
+    const quote = (spokenLine ?? "")
+      .replace(/\s+/g, " ")
+      .replace(/["'“”]/g, "")
+      .trim()
+      .slice(0, 68);
+    const titleCandidates = [
+      ...(analysis.titleOptions ?? []),
+      analysis.title,
+      quote,
+      quote ? `${quote} — ${channel?.game_name ?? analysis.category}` : "",
       `${analysis.title} — ${channel?.game_name ?? analysis.category}`,
       `${analysis.title} — ${analysis.category}`,
       `${analysis.title} · ${channel?.display_name ?? spike.channel_login}`,
-    ]);
+    ].filter((value): value is string => Boolean(value));
+    analysis.title =
+      pickUnused(titleCandidates, takenTitles) ??
+      uniqueTitle(analysis.title, takenTitles, titleCandidates);
     // The caption has to be its own line of copy: not the title, not another
     // clip's caption.
     analysis.caption = uniqueCaption(analysis.caption, takenCaptions, analysis.title, [

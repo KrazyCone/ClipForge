@@ -54,6 +54,20 @@ export function uniqueCaption(
   return `${clean} #${Date.now().toString(36).slice(-4)}`.slice(0, 90);
 }
 
+/**
+ * First candidate whose wording is not already in use, or null. This is what
+ * lets the model's own alternatives win over numbering the same phrase again.
+ */
+export function pickUnused(candidates: string[], taken: string[], limit = 90): string | null {
+  const seen = new Set(taken.map(normalise).filter(Boolean));
+  for (const raw of candidates) {
+    const candidate = String(raw ?? "").trim().replace(/\s+/g, " ").slice(0, limit);
+    const key = normalise(candidate);
+    if (candidate && key && !seen.has(key)) return candidate;
+  }
+  return null;
+}
+
 export interface TitleRow {
   id: string;
   title: string | null;

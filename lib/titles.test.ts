@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { uniqueCaption, uniqueTitle, uniqueTitleChanges } from "./titles.ts";
+import { pickUnused, uniqueCaption, uniqueTitle, uniqueTitleChanges } from "./titles.ts";
 
 test("an unused title is left alone", () => {
   assert.equal(uniqueTitle("Insane clutch", ["Other title"]), "Insane clutch");
@@ -37,6 +37,13 @@ test("changes rename only the later duplicates", () => {
 
 test("blank titles get a real one", () => {
   assert.equal(uniqueTitle("", []), "Twitch moment");
+});
+
+test("the first unused title option wins over numbering", () => {
+  const options = ["Insane clutch", "He read the ult", "One hp comeback"];
+  assert.equal(pickUnused(options, ["insane clutch!"]), "He read the ult");
+  assert.equal(pickUnused(options, []), "Insane clutch");
+  assert.equal(pickUnused(["a", "b"], ["A", "B"]), null);
 });
 
 test("an unused caption is left alone", () => {

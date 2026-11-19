@@ -86,6 +86,8 @@ export interface MomentAnalysis {
   /** transcript segments the model judged funniest, best first */
   funnySegmentIndices: number[];
   title: string;
+  /** up to three alternatives from the model, best first */
+  titleOptions?: string[];
   caption: string;
   hashtags: string[];
   provider: "workers-ai" | "heuristic";
@@ -529,10 +531,47 @@ function heuristicCaptions(input: MomentInput, category: string): string[] {
 
 function heuristicTitles(input: MomentInput, category: string): string[] {
   const g = input.gameName ?? "stream";
-  if (category === "funny") return [`${input.channelName} loses it`, `Certified ${g} comedy`, `That went badly`];
-  if (category === "dramatic") return [`${input.channelName} clutches it`, `Down to the wire`, `No way that happened`];
-  if (category === "surprising") return [`${input.channelName} flips the game`, `Nobody saw this coming`, `Instant ${g} highlight`];
-  return [`${input.channelName} pops off`, `${g} highlight`, `That was clean`];
+  const n = input.channelName;
+  // Six per category, not three: the same three phrases were all a heuristic
+  // clip could ever be called, so every clip ended up "… (2)".
+  if (category === "funny") {
+    return [
+      `${n} loses it`,
+      `Certified ${g} comedy`,
+      `That went badly`,
+      `${n} cannot believe that ${g} moment`,
+      `The ${g} plan fell apart`,
+      `Worst possible ${g} decision`,
+    ];
+  }
+  if (category === "dramatic") {
+    return [
+      `${n} clutches it`,
+      `Down to the wire`,
+      `No way that happened`,
+      `${n} saves it at the last second`,
+      `One ${g} round decided everything`,
+      `It was over until it was not`,
+    ];
+  }
+  if (category === "surprising") {
+    return [
+      `${n} flips the game`,
+      `Nobody saw this coming`,
+      `Instant ${g} highlight`,
+      `${n} pulls off the unexpected`,
+      `That ${g} read was impossible`,
+      `The comeback nobody called`,
+    ];
+  }
+  return [
+    `${n} pops off`,
+    `${g} highlight`,
+    `That was clean`,
+    `${n} takes over ${g}`,
+    `Textbook ${g} play`,
+    `Clean ${g} finish`,
+  ];
 }
 
 export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
@@ -559,6 +598,7 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
     anchorSec,
     funnySegmentIndices: [],
     title: titles[seed % titles.length],
+    titleOptions: titles,
     caption: captions[seed],
     hashtags: ["#twitch", "#clips", `#${(input.gameName ?? "gaming").toLowerCase().replace(/[^a-z0-9]/g, "")}`, "#fyp"],
     provider: "heuristic",
@@ -568,7 +608,7 @@ export function heuristicAnalysis(input: MomentInput): MomentAnalysis {
 
 const PROMPT = `You are the editor of a Twitch highlights channel. Your audience is gamers scrolling TikTok/Shorts/Reels, not the streamer.
 Reply with JSON only, no prose, matching this shape:
-{"summary":"one sentence on what happened in the clip","whyChatReacted":"one sentence on the chat reaction","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"funnySegmentIndices":[0],"beginsAtSec":number,"endsAtSec":number,"title":"short title","caption":"ALL CAPS caption under 60 chars","hashtags":["#tag"]}
+{"summary":"one sentence on what happened in the clip","whyChatReacted":"one sentence on the chat reaction","interesting":true,"category":"funny|exciting|surprising|dramatic|boring","qualityScore":0-100,"funniness":0-100,"funnySegmentIndices":[0],"beginsAtSec":number,"endsAtSec":number,"title":"short title","titles":["option 1","option 2","option 3"],"caption":"ALL CAPS caption under 60 chars","hashtags":["#tag"]}
 Rules:
 - Read the transcript segments. Pick the 1-3 segments a gaming audience would actually find funny or impressive: a punchline, a rage, a fail, an unexpected outcome, a clutch callout. Rank them best first in funnySegmentIndices and use only the supplied [n] indices. If nothing is genuinely funny or impressive, return [].
 - Do not pick greetings, thanks, sub/donation callouts, reading the game UI, or setup with no payoff. Do not pick a line that only makes sense with context that is not in the transcript.
@@ -577,6 +617,8 @@ Rules:
 - title and caption describe what HAPPENED IN THE VIDEO: the play, the reaction, the outcome. Never mention chat, viewers, donations or "chat going wild" - the chat is only how the moment was found, it is not the story.
 - Prefer concrete wording (the play, the game, the outcome) over generic hype.
 - The title must be specific to this moment and different from every recent title supplied. Never reuse or lightly reword one.
+- Give three genuinely different title options in "titles", best first. Each one describes what happened in this clip - the play, the line, the outcome - and none may repeat or reword a recent title or each other.
+- An ad break is not a moment. If the frames show an advertisement, a countdown, a "stream will continue shortly" or "be right back" screen, or a technical pause, return [] and keep qualityScore and funniness low.
 - Repeating short answers (1, 2, A, B, yes, no, !vote) means chat is voting in a poll or running a command, not reacting. A poll is not a moment by itself: only pick a segment if something genuinely funny or impressive happens on stream during it. If nothing does, return [] and keep the funniness low.`;
 
 function safeParse(text: string): Partial<MomentAnalysis> | null {
@@ -653,6 +695,12 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
       .filter((value) => Number.isInteger(value) && value >= 0)
       .slice(0, 3);
 
+    const rawTitles = (parsed as { titles?: unknown }).titles;
+    const titleOptions = (Array.isArray(rawTitles) ? rawTitles : [])
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+
     const score = clamp(Math.round(Number(parsed.qualityScore ?? fallback.qualityScore)), 0, 100);
     return {
       summary: String(parsed.summary ?? fallback.summary).slice(0, 400),
@@ -669,6 +717,10 @@ export async function analyzeMoment(e: Env, input: MomentInput): Promise<MomentA
       anchorSec: fallback.anchorSec,
       funnySegmentIndices,
       title: String(parsed.title ?? fallback.title).slice(0, 90),
+      titleOptions: [
+        String(parsed.title ?? "").slice(0, 90),
+        ...titleOptions,
+      ].filter(Boolean),
       caption: String(parsed.caption ?? fallback.caption).slice(0, 90).toUpperCase(),
       hashtags: Array.isArray(parsed.hashtags) ? parsed.hashtags.slice(0, 6).map(String) : fallback.hashtags,
       provider: "workers-ai",
